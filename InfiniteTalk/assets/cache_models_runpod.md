@@ -1,0 +1,184 @@
+# Cached models
+
+> Accelerate cold starts and reduce costs by using cached models.
+
+<Note>
+  Cached models are currently in beta. [Join our Discord](https://discord.gg/runpod) if you'd like to provide feedback.
+</Note>
+
+Enabling cached models on your Serverless endpoint can reduce [cold start times](/serverless/overview#cold-starts) to just a few seconds and dramatically reduce the cost for loading large models.
+
+## Why use cached models?
+
+* **Faster cold starts:** A "cold start" refers to the delay between when a request is received by an endpoint with no running workers and when a worker is fully "warmed up" and ready to handle the request. Using cached models can reduce cold start times to just a few seconds, even for large models.
+* **Reduced costs:** You aren't billed for worker time while your model is being downloaded. This is especially impactful for large models that can take several minutes to load.
+* **Accelerated deployment:** You can deploy cached models instantly without waiting for external downloads or transfers.
+* **Smaller container images:** By decoupling models from your container image, you can create smaller, more focused images that contain only your application logic.
+* **Shared across workers:** Multiple workers running on the same host machine can reference the same cached model, eliminating redundant downloads and saving disk space.
+
+## Cached model compatibility
+
+Cached models work with any model hosted on Hugging Face, including:
+
+* **Public models:** Any publicly available model on Hugging Face.
+* **Gated models:** Models that require you to accept terms (provide a Hugging Face access token).
+* **Private models:** Private models your Hugging Face token has access to.
+
+<Tip>
+  Cached models aren't suitable if your model is private and not hosted on Hugging Face. In that case, [bake it into your Docker image](/serverless/workers/deploy#including-models-and-external-files) instead.
+</Tip>
+
+## How it works
+
+When you select a cached model for your endpoint, Runpod automatically tries to start your workers on hosts that already contain the selected model.
+
+If no cached host machines are available, the system delays starting your workers until the model is downloaded onto the machine where your workers will run, ensuring you still won't be charged for the download time.
+
+<div style={{ marginLeft: '4rem'}}>
+  ```mermaid  theme={"theme":{"light":"github-light","dark":"github-dark"}}
+  %%{init: {'theme':'base', 'themeVariables': { 'primaryColor':'#5D29F0','primaryTextColor':'#fff','primaryBorderColor':'#874BFF','lineColor':'#AE6DFF','secondaryColor':'#AE6DFF','tertiaryColor':'#FCB1FF','edgeLabelBackground':'#AE6DFF', 'fontSize':'15px','fontFamily':'font-inter'}}}%%
+
+  flowchart TD
+      Start([Request received]) --> CheckWorkers{Worker<br/>ready?}
+      
+      CheckWorkers -->|"&nbsp;&nbsp;Yes&nbsp;&nbsp;"| Process[Process request]
+      
+      CheckWorkers -->|"&nbsp;&nbsp;No&nbsp;&nbsp;"| CheckCache{Cached model<br/>host available?}
+      
+      CheckCache -->|"&nbsp;&nbsp;Yes&nbsp;&nbsp;"| FastStart[Start worker on<br/>cached host]
+      FastStart --> Ready1[Worker ready<br/>in seconds]
+      Ready1 --> Process
+      
+      CheckCache -->|"&nbsp;&nbsp;No&nbsp;&nbsp;"| WaitForCache[Wait for model download<br/>on target host]
+      WaitForCache --> Ready2[Worker ready<br/>after download]
+      Ready2 --> Process
+      
+      Process --> Response([Return response])
+
+      style Start fill:#5D29F0,stroke:#874BFF,color:#FFFFFF
+      style Response fill:#5D29F0,stroke:#874BFF,color:#FFFFFF
+      style FastStart fill:#41F420,stroke:#A7FF43,color:#000000
+      style Ready1 fill:#874BFF,stroke:#AE6DFF,color:#FFFFFF
+      style WaitForCache fill:#FFC01F,stroke:#FFC01F,color:#000000
+      style Ready2 fill:#874BFF,stroke:#AE6DFF,color:#FFFFFF
+      style CheckWorkers fill:#1B0656,stroke:#874BFF,color:#FFFFFF
+      style CheckCache fill:#1B0656,stroke:#874BFF,color:#FFFFFF
+      style Process fill:#FCB1FF,stroke:#AE6DFF,color:#000000
+
+      linkStyle default stroke-width:2px
+  ```
+</div>
+
+## Enable cached models
+
+Follow these steps to select and add a cached model to your Serverless endpoint:
+
+<Steps>
+  <Step title="Create a new endpoint">
+    Navigate to the [Serverless section](https://www.console.runpod.io/serverless) of the console and click **New Endpoint**.
+  </Step>
+
+  <Step title="Configure the model">
+    In the **Endpoint Configuration** step, scroll down to **Model** and add the link or path for the model you want to use.
+
+    For example, `Qwen/qwen3-32b-awq`.
+
+    <Frame alt="Cached model setting">
+      <img src="https://mintcdn.com/runpod-b18f5ded/Yxk8joMX7rldAU9k/images/model-cache-setting.png?fit=max&auto=format&n=Yxk8joMX7rldAU9k&q=85&s=3ac8824c9c1e598b5aedc39333e3c8a4" data-og-width="2586" width="2586" data-og-height="1830" height="1830" data-path="images/model-cache-setting.png" data-optimize="true" data-opv="3" srcset="https://mintcdn.com/runpod-b18f5ded/Yxk8joMX7rldAU9k/images/model-cache-setting.png?w=280&fit=max&auto=format&n=Yxk8joMX7rldAU9k&q=85&s=1e1ed339e0064784e2ce719e875a3bb2 280w, https://mintcdn.com/runpod-b18f5ded/Yxk8joMX7rldAU9k/images/model-cache-setting.png?w=560&fit=max&auto=format&n=Yxk8joMX7rldAU9k&q=85&s=9cb4c6cc07d3a7219c5e1346276d8a04 560w, https://mintcdn.com/runpod-b18f5ded/Yxk8joMX7rldAU9k/images/model-cache-setting.png?w=840&fit=max&auto=format&n=Yxk8joMX7rldAU9k&q=85&s=f6fd6fb6affb798313955f79ea335dc9 840w, https://mintcdn.com/runpod-b18f5ded/Yxk8joMX7rldAU9k/images/model-cache-setting.png?w=1100&fit=max&auto=format&n=Yxk8joMX7rldAU9k&q=85&s=805835d8f1711f8ced9949437bbf2004 1100w, https://mintcdn.com/runpod-b18f5ded/Yxk8joMX7rldAU9k/images/model-cache-setting.png?w=1650&fit=max&auto=format&n=Yxk8joMX7rldAU9k&q=85&s=8c82542e3d06c0e90e75d34af8cc38ad 1650w, https://mintcdn.com/runpod-b18f5ded/Yxk8joMX7rldAU9k/images/model-cache-setting.png?w=2500&fit=max&auto=format&n=Yxk8joMX7rldAU9k&q=85&s=880b6d621ab4345eaeef39564941f66d 2500w" />
+    </Frame>
+  </Step>
+
+  <Step title="Add an access token (if needed)">
+    If you're using a gated model, you'll need to enter a [Hugging Face access token](https://huggingface.co/docs/hub/en/security-tokens).
+  </Step>
+
+  <Step title="Deploy the endpoint">
+    Complete your endpoint configuration and click **Deploy Endpoint** .
+  </Step>
+</Steps>
+
+You can add a cached model to an existing endpoint by selecting **Manage → Edit Endpoint** in the endpoint details page and updating the **Model** field.
+
+## Using cached models in your worker
+
+When using [vLLM workers](/serverless/vllm/overview) or other official Runpod worker images, you can usually just set the **Model** field as shown above (or use the `MODEL_NAME` environment variable), and your workers will automatically use the cached model for inference.
+
+To use cached models with [custom workers](/serverless/workers/custom-worker), you'll need to manually locate the cached model path and integrate it into your worker code.
+
+### Where cached models are stored
+
+Cached models are stored at `/runpod-volume/huggingface-cache/hub/` following Hugging Face cache conventions. The directory structure replaces forward slashes (`/`) from the original model name with double dashes (`--`), and includes a version hash subdirectory.
+
+<Note>
+  While cached models use the same mount path as network volumes (`/runpod-volume/`), the model loaded from the cache will load significantly faster than the same model loaded from a network volume.
+</Note>
+
+The path structure follows this pattern:
+
+```
+/runpod-volume/huggingface-cache/hub/models--HF_ORGANIZATION--MODEL_NAME/snapshots/VERSION_HASH/
+```
+
+For example, the model `gensyn/qwen2.5-0.5b-instruct` would be stored at:
+
+```
+/runpod-volume/huggingface-cache/hub/models--gensyn--qwen2.5-0.5b-instruct/snapshots/317b7eb96312eda0c431d1dab1af958a308cb35e/
+```
+
+### Programmatically find cached models
+
+To dynamically locate cached models without hardcoding paths, you can use this helper function to scan the cache directory:
+
+```python find_model_path.py theme={"theme":{"light":"github-light","dark":"github-dark"}}
+import os
+
+CACHE_DIR = "/runpod-volume/huggingface-cache/hub"
+
+def find_model_path(model_name):
+    """
+    Find the path to a cached model.
+    
+    Args:
+        model_name: The model name from Hugging Face
+        (e.g., 'Qwen/Qwen2.5-0.5B-Instruct')
+    
+    Returns:
+        The full path to the cached model, or None if not found
+    """
+    # Convert model name format: "Org/Model" -> "models--Org--Model"
+    cache_name = model_name.replace("/", "--")
+    snapshots_dir = os.path.join(CACHE_DIR, f"models--{cache_name}", "snapshots")
+    
+    # Check if the model exists in cache
+    if os.path.exists(snapshots_dir):
+        snapshots = os.listdir(snapshots_dir)
+        if snapshots:
+            # Return the path to the first (usually only) snapshot
+            return os.path.join(snapshots_dir, snapshots[0])
+    
+    return None
+
+# Example usage
+model_path = find_model_path("Qwen/Qwen2.5-0.5B-Instruct")
+if model_path:
+    print(f"Model found at: {model_path}")
+else:
+    print("Model not found in cache")
+```
+
+### Custom worker examples
+
+The following sample applications demonstrate how you can integrate cached models into your custom workers:
+
+* [Cached models + LLMs](https://github.com/stuffbyt/model-store-worker): A custom worker that uses cached models to serve LLMs.
+* [Cached models + Stable diffusion](https://github.com/stuffbyt/Stable-diffusion-cached-worker): A custom worker that uses cached models to generate images with Stable diffusion.
+
+## Current limitations
+
+* Each endpoint is currently limited to one cached model at a time.
+* If a Hugging Face repository contains multiple quantization versions of a model (for example, 4-bit AWQ and 8-bit GPTQ versions), the system currently downloads all quantization versions. The ability to select specific quantizations will be available in a future update.
+
+
+---
+
+> To find navigation and other pages in this documentation, fetch the llms.txt file at: https://docs.runpod.io/llms.txt
