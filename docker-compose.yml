@@ -1,0 +1,63 @@
+services:
+  redis:
+    image: "redis:alpine"
+    container_name: infinitetalk_redis
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    environment:
+      - ALLOW_GENERATION=false
+
+  api:
+    build: .
+    container_name: infinitetalk_api
+    env_file:
+      - .env.docker
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount the src directory to allow for live-reloading if uvicorn is run with --reload
+      - ./src:/app/src
+      # Mount the model weights so they are not included in the image
+      - ./InfiniteTalk/weights:/app/InfiniteTalk/weights:ro
+    # I am assuming the FastAPI app instance is named 'app' in 'src/app/main.py'
+    # and that this is the main API server for the project.
+    working_dir: /app/src
+    command: [ "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000" ]
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  video-worker:
+    build: .
+    container_name: infinitetalk_video_worker
+    env_file:
+      - .env.docker
+    volumes:
+      # Mount the output directory to persist generated videos on the host
+      - ./output:/app/output
+      # Mount the audio directory as it's used by the test script
+      - ./audio:/app/audio
+      # Mount the model weights so they are not included in the image
+      - ./InfiniteTalk/weights:/app/InfiniteTalk/weights:ro
+    # This command runs the video worker script.
+    command: [ "python", "InfiniteTalk/workers/video/video_worker.py" ]
+    depends_on:
+      - redis
+    # Set restart policy to 'no' for now, so we can inspect logs if it fails.
+    # Change to 'unless-stopped' for production.
+    restart: on-failure
+
+volumes:
+  redis_data:

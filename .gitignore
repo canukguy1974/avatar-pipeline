@@ -1,0 +1,49 @@
+# Secrets
+.env
+.env.*
+! .env.example
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+.codex/
+
+# Logs
+*.log
+nohup.out
+
+# Large Media / Outputs
+output/
+audio/
+hls/
+*.mp4
+*.wav
+*.mp3
+*.flac
+*.jpg
+*.png
+
+# IDE
+.vscode/
+.idea/
+
+# System
+.DS_Store
+Thumbs.db
+
+# InfiniteTalk specific
+InfiniteTalk/weights/
+weights/
+checkpoints/
+
+
+# Node
+node_modules/
+dist/
+build/

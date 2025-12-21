@@ -1,0 +1,37 @@
+# Git
+.git
+.gitignore
+.cache
+*.safetensors
+*.ckpt
+*.wav
+*.mp4
+*.mkv
+
+# Virtual environments
+.venv
+venv
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# IDEs
+.idea
+.vscode
+
+# Logs and output files
+nohup.out
+*.log
+output/
+
+# Large model weights
+InfiniteTalk/weights/
+
+# Docker files
+Dockerfile
+.dockerignore
+docker-compose.yml
+.env.docker
