@@ -6,12 +6,10 @@ services:
       - redis_data:/data
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
+      test: [ "CMD-SHELL", "redis-cli ping | grep -q PONG" ]
       interval: 5s
       timeout: 3s
       retries: 5
-    environment:
-      - ALLOW_GENERATION=false
 
   api:
     build: .
@@ -33,7 +31,7 @@ services:
       - redis
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" ]
+      test: [ "CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")'" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -44,6 +42,9 @@ services:
     container_name: infinitetalk_video_worker
     env_file:
       - .env.docker
+    environment:
+      - FAKE_RUN=true
+      - ALLOW_GENERATION=true
     volumes:
       # Mount the output directory to persist generated videos on the host
       - ./output:/app/output

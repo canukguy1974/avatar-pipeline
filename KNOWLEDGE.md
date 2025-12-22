@@ -68,6 +68,7 @@ graph TD
 - **File Naming**:
     - Idle: `idle_XXXXXX.m4s` (generated once/looped).
     - Live: `seg_XXXX.m4s` (unique per session/sequence).
+- **Atomic Updates**: `manifest.m3u8` is written to a `.tmp` file first and then atomically renamed to ensure clients never read incomplete playlists.
 - **Directory Invariants**: `HLS_DIR`, `AUDIO_DIR`, and `STATIC_DIR` must be shared/mirrored between Backend and Worker if they run on different hosts/containers.
 
 ## ⚠️ Known Gotchas & Patterns
@@ -77,6 +78,7 @@ graph TD
 3. **FFmpeg Imports**: `HLSWriter` requires `contextlib` for suppressed error handling during manifest writes.
 4. **WebSocket Blocking**: Avoid heavy CPU tasks in the FastAPI WS handler; offload to the Redis/Worker pipeline.
 5. **Singleton HLS**: Replacing the `<video>` element's `src` while an HLS instance is attached causes standard MediaSource errors. Always `hls.destroy()` before switching modes.
+6. **Sliding Window vs Event**: `HLSWriter` must have `delete_old=True` to be a true "Sliding Window". `EXT-X-PLAYLIST-TYPE:EVENT` should only be used if `delete_old=False` (growing playlist). Mixing them causes playback stalls.
 
 ## 🛠️ Operations & Setup
 

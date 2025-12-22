@@ -10,7 +10,7 @@ COPY . .
 # Install any needed packages specified in requirements.txt
 # Using --no-cache-dir to reduce image size
 RUN pip install --upgrade pip
-RUN pip install --no-cache-dir --timeout=100 -r InfiniteTalk/requirements.txt
+RUN pip install --no-cache-dir --timeout=100 -r InfiniteTalk/requirements.base.txt
 RUN apt-get update && apt-get install -y ffmpeg
 
 

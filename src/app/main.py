@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi import HTTPException
 from dotenv import load_dotenv
 
 # Load .env from project root (not current directory)
@@ -71,7 +72,7 @@ def _init_global_idle():
         return  # Already running
     
     print(f"DEBUG: Initializing global idle FFmpeg", flush=True)
-    _global_hls_writer = HLSWriter(HLS_DIR, window=8, default_td=3.0, delete_old=False)
+    _global_hls_writer = HLSWriter(HLS_DIR, window=8, default_td=3.0, delete_old=True)
     
     if IDLE_LOOP_MP4.exists():
         try:
@@ -122,12 +123,16 @@ async def startup():
     _init_global_idle()
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-app.mount("/hls", StaticFiles(directory=str(HLS_DIR)), name="hls")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "HEAD", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -135,6 +140,35 @@ app.add_middleware(
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+@app.api_route("/hls/{filename}", methods=["GET", "HEAD"])
+async def serve_hls(filename: str):
+    path = HLS_DIR / filename
+    if not path.exists():
+        raise HTTPException(status_code=404)
+
+    if filename.endswith(".m3u8"):
+        return FileResponse(
+            path,
+            media_type="application/vnd.apple.mpegurl",
+            headers={
+                "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    if filename.endswith(".ts"):
+        return FileResponse(
+            path,
+            media_type="video/mp2t",
+            headers={
+                "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    return FileResponse(path)
+
 
 @app.post("/api/nop")
 async def nop():
@@ -154,7 +188,7 @@ async def session(ws: WebSocket):
     _init_global_idle()
 
     # Use the global HLS writer if available
-    hls = _global_hls_writer if _global_hls_writer else HLSWriter(HLS_DIR, window=8, default_td=3.0, delete_old=False)
+    hls = _global_hls_writer if _global_hls_writer else HLSWriter(HLS_DIR, window=8, default_td=3.0, delete_old=True)
     print(f"DEBUG: Using HLS writer (default_td={hls.default_td})", flush=True)
 
     # Wait briefly for manifest/init files to appear
@@ -237,16 +271,20 @@ class Session:
         """Read the files created by start_idle_segmentation() and feed them until live begins."""
         print(f"DEBUG: _seed_idle_until_live started", flush=True)
         self.hls.switch_source("idle")
-        idle_segment_duration = 3.0  # Match FFmpeg -hls_time setting
+        idle_segment_duration = 3.0  # Match FFmpeg -hls_time setting (approx)
         
-        # Find any available segment (FFmpeg maintains a sliding window, deletes old segments)
-        # Scan recent directories, starting from a high number and going down
+        # Find any available segments
         import os
-        existing_segments = sorted([f for f in os.listdir(HLS_DIR) if f.startswith("idle_") and f.endswith(".m4s")])
+        def get_segments():
+            return sorted([f for f in os.listdir(HLS_DIR) if f.startswith("idle_") and f.endswith(".m4s")])
+
+        existing_segments = get_segments()
         print(f"DEBUG: Found {len(existing_segments)} idle segments", flush=True)
+        
+        # Wait a bit if none found initially
         if not existing_segments:
-            await asyncio.sleep(1.0)  # Wait for FFmpeg to create first segment
-            existing_segments = sorted([f for f in os.listdir(HLS_DIR) if f.startswith("idle_") and f.endswith(".m4s")])
+            await asyncio.sleep(1.0)
+            existing_segments = get_segments()
             print(f"DEBUG: After wait, found {len(existing_segments)} idle segments", flush=True)
         
         if not existing_segments:
@@ -254,22 +292,52 @@ class Session:
             await self.ws.send_json({"type": "status", "note": "No idle segments available"})
             return
         
-        # Extract segment index from first available segment
-        first_seg_name = existing_segments[0]
-        i = int(first_seg_name.split("_")[1].split(".")[0])  # Extract number from "idle_XXXXXX.m4s"
-        print(f"DEBUG: Starting from segment {i}: {first_seg_name}", flush=True)
+        # Start from a recent segment to avoid playing ancient history or getting stuck in gaps too far back.
+        # If we have many segments, start from the last 5 or so.
+        start_index = 0
+        if len(existing_segments) > 6:
+            start_index = len(existing_segments) - 6
         
-        # Now stream continuously from that segment onwards
+        first_seg_name = existing_segments[start_index]
+        current_seq = int(first_seg_name.split("_")[1].split(".")[0])
+        print(f"DEBUG: Starting from segment sequence {current_seq} ({first_seg_name})", flush=True)
+        
+        # Continuous streaming loop
         while not self._live_started and self.alive:
-            seg = HLS_DIR / f"idle_{i:06d}.m4s"
-            if seg.exists():
-                print(f"DEBUG: Adding segment {seg.name}", flush=True)
-                self.hls.add_segment(seg.name, idle_segment_duration)
-                await self.ws.send_json({"type":"video_segment","uri":f"/hls/{seg.name}","dur":idle_segment_duration})
-                print(f"DEBUG: Sent video_segment for {seg.name}", flush=True)
-                i += 1
+            seg_name = f"idle_{current_seq:06d}.m4s"
+            seg_path = HLS_DIR / seg_name
+            
+            if seg_path.exists():
+                print(f"DEBUG: Adding segment {seg_name}", flush=True)
+                # Try to get actual duration if possible, or use default
+                # (For now fixed default is fine as they are generated uniformly)
+                self.hls.add_segment(seg_name, idle_segment_duration)
+                await self.ws.send_json({"type":"video_segment","uri":f"/hls/{seg_name}","dur":idle_segment_duration})
+                current_seq += 1
             else:
-                await asyncio.sleep(0.1)
+                # Segment missing. Check if there are NEWER segments (gap jump).
+                # Re-scan directory to see if we fell behind or hit a gap.
+                all_segs = get_segments()
+                # Filter for segments with sequence > current_seq
+                future_segs = []
+                for f in all_segs:
+                    try:
+                        s_seq = int(f.split("_")[1].split(".")[0])
+                        if s_seq > current_seq:
+                            future_segs.append(s_seq)
+                    except (ValueError, IndexError):
+                        pass
+                
+                if future_segs:
+                    next_seq = min(future_segs)
+                    print(f"DEBUG: Gap detected. Current {current_seq} missing, jumping to {next_seq}", flush=True)
+                    current_seq = next_seq
+                    # Immediate continue to process this new segment
+                    continue
+                else:
+                    # No future segments found, we are likely at the live edge waiting for ffmpeg
+                    await asyncio.sleep(0.1)
+
         print(f"DEBUG: _seed_idle_until_live exited", flush=True)
 
     async def run(self):

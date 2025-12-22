@@ -23,18 +23,22 @@ export default function Page() {
   const [prompt, setPrompt] = useState('Tell me about yourself in 1 sentence.')
   const [sending, setSending] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
+  const hlsRef = useRef<any | null>(null)
+  const isAttachingRef = useRef(false)
 
   const appendLog = (s: string) => setLog((prev) => [s, ...prev].slice(0, 100))
 
   // Attach HLS source to <video> using hls.js at runtime for Chrome
   const attachHls = async () => {
-    if (attached) return
+    if (attached || isAttachingRef.current) return
+    isAttachingRef.current = true
 
     // Wait a tick to ensure video element is fully mounted
     await new Promise(r => setTimeout(r, 100))
 
     if (!videoRef.current) {
       appendLog('Video element not found')
+      isAttachingRef.current = false
       return
     }
 
@@ -42,7 +46,13 @@ export default function Page() {
       // @ts-ignore
       const Hls = (await import('hls.js/dist/hls.min.js')).default || (await import('hls.js')).default
       if (Hls.isSupported()) {
+        if (hlsRef.current) {
+          hlsRef.current.destroy()
+        }
+
         const hls = new Hls({ maxBufferLength: 10, debug: true })
+        hlsRef.current = hls
+
         // Load the FFmpeg-generated manifest directly (idle.m3u8) to avoid conflicts
         hls.loadSource(`${BACKEND_URL}/hls/idle.m3u8`)
 
@@ -79,6 +89,8 @@ export default function Page() {
       }
     } catch (e) {
       appendLog('Failed to load hls.js: ' + String(e))
+    } finally {
+      isAttachingRef.current = false
     }
   }
 
@@ -143,6 +155,10 @@ export default function Page() {
   useEffect(() => {
     if (!videoRef.current) return
     if (mockMode) {
+      if (hlsRef.current) {
+        hlsRef.current.destroy()
+        hlsRef.current = null
+      }
       setAttached(true)
       videoRef.current.src = '/demo/out.mp4' // place a demo clip under public/demo/out.mp4
       videoRef.current.play().catch(() => { })
@@ -150,14 +166,24 @@ export default function Page() {
       setAttached(false)
       videoRef.current.src = ''
     }
+
+    return () => {
+      if (hlsRef.current) {
+        hlsRef.current.destroy()
+        hlsRef.current = null
+      }
+    }
   }, [mockMode])
 
   const onSend = async () => {
+    if (!wsRef.current || wsRef.current.readyState !== 1) {
+      appendLog('WS not open; cannot send prompt')
+      return
+    }
     setSending(true)
-    // In real flow, POST to backend -> kick GPT/ElevenLabs chain
     try {
-      await fetch('/api/nop', { method: 'POST', body: JSON.stringify({ prompt }) })
-      appendLog('Prompt sent (stub).')
+      wsRef.current.send(JSON.stringify({ type: 'prompt', text: prompt }))
+      appendLog('Prompt sent to backend')
     } catch (e) {
       appendLog('Send failed: ' + String(e))
     } finally {
@@ -186,7 +212,7 @@ export default function Page() {
         <section className="grid md:grid-cols-2 gap-6">
           <div className="bg-zinc-900/60 rounded-2xl p-4 border border-zinc-800">
             <div className="aspect-video overflow-hidden rounded-xl bg-zinc-950/60 flex items-center justify-center">
-              <video ref={videoRef} autoPlay controls playsInline muted className="w-full h-full" />
+              <video ref={videoRef} autoPlay loop controls playsInline muted className="w-full h-full" />
             </div>
             <p className="mt-3 text-xs text-zinc-400">Video attaches when first segment is ready. In Chrome we load hls.js automatically.</p>
           </div>
@@ -230,18 +256,4 @@ export default function Page() {
   )
 }
 
-const onSend = async () => {
-  if (!wsRef.current || wsRef.current.readyState !== 1) {
-    appendLog('WS not open; cannot send prompt')
-    return
-  }
-  setSending(true)
-  try {
-    wsRef.current.send(JSON.stringify({ type: 'prompt', text: prompt }))
-    appendLog('Prompt sent to backend')
-  } catch (e) {
-    appendLog('Send failed: ' + String(e))
-  } finally {
-    setSending(false)
-  }
-}
+

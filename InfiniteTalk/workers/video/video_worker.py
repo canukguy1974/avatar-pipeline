@@ -25,8 +25,31 @@ INFINITETALK_DIR = os.getenv("INFINITETALK_DIR")
 WAV2VEC_DIR = os.getenv("WAV2VEC_DIR")
 AUDIO_SAVE_DIR = os.getenv("AUDIO_SAVE_DIR")
 
+FAKE_RUN = os.getenv("FAKE_RUN", "true").lower() == "true"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
-ALLOW_GENERATION = os.getenv("ALLOW_GENERATION", "false") == "true"
+ALLOW_GENERATION = os.getenv("ALLOW_GENERATION", "false").lower() == "true"
+
+def cleanup_output_dir(output_dir, max_files=5):
+    """
+    Keep only the most recent max_files in the output directory.
+    """
+    try:
+        files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if os.path.isfile(os.path.join(output_dir, f))]
+        if len(files) <= max_files:
+            return
+        
+        # Sort files by modification time (oldest first)
+        files.sort(key=os.path.getmtime)
+        
+        # Remove oldest files
+        for f in files[:-max_files]:
+            try:
+                os.remove(f)
+                print(f"Cleaned up old result: {f}")
+            except Exception as e:
+                print(f"Failed to delete {f}: {e}")
+    except Exception as e:
+        print(f"Error during output directory cleanup: {e}")
 
 def main():
     """
@@ -99,8 +122,11 @@ def main():
                         output_filename = f"{job_id}.mp4"
                         output_path = os.path.join(temp_dir, output_filename)
 
-                        if args.get("task") != "dryrun" and not ALLOW_GENERATION:
-                            print("Generation disabled — refusing non-dryrun task")
+                        is_dryrun = args.get("task") == "dryrun"
+
+                        if not is_dryrun and not ALLOW_GENERATION:
+                            print("🚫 Generation disabled — refusing non-dryrun task")
+                            # relying on finally block for xack if we continue, or explicit here is fine too
                             r.xack(AUDIO_STREAM, CONSUMER_GROUP, message_id)
                             continue
 
@@ -127,34 +153,47 @@ def main():
                             '--ring_size', str(args['ring_size']),
                         ]
                         
-                        if args.get('n_prompt'):
-                            command.extend(['--n_prompt', args['n_prompt']])
+                        if args.get('n_prompt') is not None:
+                            command.extend(['--n_prompt', str(args['n_prompt'])])
 
                         print(f"Running command: {' '.join(command)}")
                         
-                        if DRY_RUN:
-                            print("🧪 DRY RUN ENABLED — skipping InfiniteTalk execution")
-                            print("Command would have been:")
-                            print(" ".join(command))
+                        if FAKE_RUN or is_dryrun:
+                            print(f"🧪 FAKE RUN for job {job_id}")
 
-                            # create a fake output file in temp dir so downstream logic handles it
-                            with open(output_path, "wb") as f:
-                                f.write(b"FAKE_MP4_DATA")
+                            src = "/app/src/hls/idle_loop.mp4"
+                            output_dir = "output"
+                            os.makedirs(output_dir, exist_ok=True)
 
-                        else:
-                            subprocess.run(command, check=True, capture_output=True, text=True)
+                            final_video_path = os.path.join(output_dir, f"{job_id}.mp4")
+                            
+                            # Try to use the real idle loop if available, else fallback to dummy
+                            if os.path.exists(src):
+                                shutil.copy(src, final_video_path)
+                            else:
+                                print(f"⚠️ Warning: Mock video source {src} not found. Using dummy data.")
+                                with open(final_video_path, "wb") as f:
+                                    f.write(b"FAKE_MP4_DATA")
 
-                        
+                            r.xadd(VIDEO_STREAM, {
+                                "job_id": job_id,
+                                "video_path": final_video_path
+                            })
+
+                            r.set(f"result:{job_id}", final_video_path, ex=3600)
+                            r.xack(AUDIO_STREAM, CONSUMER_GROUP, message_id)
+                            print(f"FAKE video published for {job_id}")
+                            
+                            cleanup_output_dir(output_dir)
+                            continue
+
+                        # Real execution
+                        subprocess.run(command, check=True, capture_output=True, text=True)
+
                         # The output path from the script includes the extension, but save_file does not.
                         video_path = output_path
                         
                         if os.path.exists(video_path):
-                            # In a real scenario, you might want to move this file to a persistent storage
-                            # and send the final path. For now, we'll just send the path in the temp dir.
-                            # For the purpose of this exercise, we will assume the frontend can access this path.
-                            # In a real system, this would be a URL to a file served by a static file server.
-                            
-                            # To make it runnable, we will copy the file to a known location 'output/'
                             output_dir = 'output'
                             os.makedirs(output_dir, exist_ok=True)
                             final_video_path = os.path.join(output_dir, output_filename)
@@ -168,6 +207,9 @@ def main():
                             result_key = f"result:{job_id}"
                             r.set(result_key, final_video_path, ex=3600) # 1-hour expiration
                             print(f"Set result for job {job_id} in key '{result_key}'")
+                            
+                            # Clean up old results
+                            cleanup_output_dir(output_dir)
 
                         else:
                             print(f"Error: Video file not found at {video_path}")
