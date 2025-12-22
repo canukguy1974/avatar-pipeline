@@ -47,3 +47,6 @@ checkpoints/
 node_modules/
 dist/
 build/
+
+# Windows
+*.Zone.Identifier

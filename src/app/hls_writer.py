@@ -38,7 +38,17 @@ class HLSWriter:
                 out.append("#EXT-X-DISCONTINUITY")
             out.append(f"#EXTINF:{dur:.3f},")
             out.append(name)
-        (self.hls_dir / "manifest.m3u8").write_text("\n".join(out) + "\n", encoding="utf-8")
+        # Write atomically: temp file -> rename
+        tmp_manifest = self.hls_dir / "manifest.m3u8.tmp"
+        tmp_manifest.write_text("\n".join(out) + "\n", encoding="utf-8")
+        try:
+            tmp_manifest.replace(self.hls_dir / "manifest.m3u8")
+        except PermissionError:
+            # Fallback for Windows if file is locked (rare but possible)
+            import os
+            if (self.hls_dir / "manifest.m3u8").exists():
+                os.remove(self.hls_dir / "manifest.m3u8")
+            tmp_manifest.replace(self.hls_dir / "manifest.m3u8")
     
     def add_segment(self, filename: str, duration: float):
         self._segments.append((filename, duration, self._pending_discontinuity))
@@ -77,27 +87,24 @@ class HLSWriter:
         idle_mp4_abs = idle_mp4.resolve()
         hls_dir_abs = self.hls_dir.resolve()
         
-        # Use a 30-second duration (multiple of 3s segments) so FFmpeg will actually produce output
-        # This is much longer than a single video playback, so it feels like infinite looping
-        output_duration = "30s"
+        # Use truly infinite looping with -stream_loop -1
         
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "warning",
-            "-stream_loop", "10",  # Loop the input 10 times (should be plenty)
+            "ffmpeg", "-hide_banner", "-loglevel", "verbose", "-stats",
+            "-stream_loop", "-1",  # Loop the input indefinitely
             "-i", str(idle_mp4_abs),
-            "-t", output_duration,  # Limit total output duration
             "-c:v", "copy", "-c:a", "copy",
             "-f", "hls",
             "-hls_segment_type", "fmp4",
-            "-hls_time", "3",
-            "-hls_list_size", "8",
+            "-hls_time", "5",
+            "-hls_list_size", "12",
             "-hls_flags", "delete_segments+independent_segments",
             "-hls_fmp4_init_filename", "init.mp4",  # Relative to cwd
             "-hls_segment_filename", "idle_%06d.m4s",  # Relative to cwd
             "idle.m3u8",  # Relative to cwd
         ]
         print(f"DEBUG: Starting FFmpeg from {hls_dir_abs}", flush=True)
-        print(f"DEBUG: FFmpeg will loop and produce ~{int(30/3)} segments", flush=True)
+        print(f"DEBUG: FFmpeg will loop indefinitely and maintain a rolling window of segments", flush=True)
         # Run FFmpeg from the HLS directory so relative paths work correctly
         self._idle_proc = subprocess.Popen(cmd, cwd=str(hls_dir_abs))
 
