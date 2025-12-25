@@ -25,8 +25,8 @@ graph TD
 
 ### 1. Frontend (`/web`)
 - **Tech Stack**: Next.js, Tailwind, Hls.js.
-- **HLS Management**: Uses a singleton `hlsRef` and `isAttachingRef` to prevent "MediaSource" attachment race conditions.
-- **Logs**: Forwards `hls.js` logs/errors to the backend via WebSocket (`type: client_log`) for centralized debugging.
+- **HLS Management**: Uses a singleton `hlsRef`, `isAttachingRef`, and `attachedRef` (hook-safe) to prevent "MediaSource" attachment race conditions and redundant re-attachments that cause flickering.
+- **Logs**: Forwards `hls.js` logs/errors to the backend via WebSocket (`type: client_log`). Segment URLs and indices (`video_segment`) are logged to verify synchronization.
 
 ### 2. Backend (`/src/app`)
 - **Tech Stack**: FastAPI, WebSockets, FFmpeg.
@@ -68,7 +68,11 @@ graph TD
 - **File Naming**:
     - Idle: `idle_XXXXXX.m4s` (generated once/looped).
     - Live: `seg_XXXX.m4s` (unique per session/sequence).
-- **Atomic Updates**: `manifest.m3u8` is written to a `.tmp` file first and then atomically renamed to ensure clients never read incomplete playlists.
+- **Manifest Sync**: `manifest.m3u8` must strictly mirror the authoritative `idle.m3u8` during idle periods:
+    - **Sequence**: `#EXT-X-MEDIA-SEQUENCE` must match the source (FFmpeg often starts at high numbers).
+    - **Target Duration**: Must be `>=` any segment (e.g., 6s for FFmpeg defaults).
+    - **Discontinuities**: `#EXT-X-DISCONTINUITY` and `#EXT-X-DISCONTINUITY-SEQUENCE` are required for looping fMP4 content with resetting timestamps.
+- **Atomic Updates**: `manifest.m3u8` is written to a `.tmp` file first and then atomically renamed.
 - **Directory Invariants**: `HLS_DIR`, `AUDIO_DIR`, and `STATIC_DIR` must be shared/mirrored between Backend and Worker if they run on different hosts/containers.
 
 ## ⚠️ Known Gotchas & Patterns
@@ -77,8 +81,12 @@ graph TD
 2. **Path Resolution**: Use absolute paths in `.env` to avoid `FileNotFoundError` when workers run from different CWDs.
 3. **FFmpeg Imports**: `HLSWriter` requires `contextlib` for suppressed error handling during manifest writes.
 4. **WebSocket Blocking**: Avoid heavy CPU tasks in the FastAPI WS handler; offload to the Redis/Worker pipeline.
-5. **Singleton HLS**: Replacing the `<video>` element's `src` while an HLS instance is attached causes standard MediaSource errors. Always `hls.destroy()` before switching modes.
+5. **Singleton HLS**: Replacing the `<video>` element's `src` while an HLS instance is attached causes standard MediaSource errors. Always `hls.destroy()` before switching modes. Use an `attachedRef` in the frontend to prevent redundant attachments caused by WebSocket state flickering.
 6. **Sliding Window vs Event**: `HLSWriter` must have `delete_old=True` to be a true "Sliding Window". `EXT-X-PLAYLIST-TYPE:EVENT` should only be used if `delete_old=False` (growing playlist). Mixing them causes playback stalls.
+7. **HLS Segment Gaps**: The idle video mechanism produces `idle_*.m4s` files. If there are gaps in the sequence (e.g. `idle_01`, `idle_03`), the server loop (`_seed_idle_until_live`) must actively detect and jump over them, otherwise it stalls waiting for the missing segment.
+8. **WebSocket Lifecycle**: The `manifest.m3u8` is NOT updated unless a client session is active. `Session.run()` must await `recv_task` to keep the loop running.
+9. **Manifest Sync Wall**: If the `manifest.m3u8` is missing `#EXT-X-MEDIA-SEQUENCE` or has a `TARGETDURATION` lower than the actual media (e.g. 3s target vs 6s media), players will "hit a wall" at ~24-30s and stall.
+10. **State Stale Closures**: WebSocket `onmessage` handlers in React can capture old state. Use `useRef` for values like `attached` to ensure the handler sees the latest status and doesn't trigger redundant logic (like Hls re-initialization).
 
 ## 🛠️ Operations & Setup
 

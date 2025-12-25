@@ -25,6 +25,7 @@ export default function Page() {
   const wsRef = useRef<WebSocket | null>(null)
   const hlsRef = useRef<any | null>(null)
   const isAttachingRef = useRef(false)
+  const attachedRef = useRef(false)
 
   const appendLog = (s: string) => setLog((prev) => [s, ...prev].slice(0, 100))
 
@@ -53,8 +54,8 @@ export default function Page() {
         const hls = new Hls({ maxBufferLength: 10, debug: true })
         hlsRef.current = hls
 
-        // Load the FFmpeg-generated manifest directly (idle.m3u8) to avoid conflicts
-        hls.loadSource(`${BACKEND_URL}/hls/idle.m3u8`)
+        // Load the main managed manifest (manifest.m3u8) which handles both idle and live segments
+        hls.loadSource(`${BACKEND_URL}/hls/manifest.m3u8`)
 
         // CRITICAL: attachMedia must be called AFTER loadSource and BEFORE play
         hls.attachMedia(videoRef.current)
@@ -80,6 +81,7 @@ export default function Page() {
         })
 
         setAttached(true)
+        attachedRef.current = true
       } else if (videoRef.current.canPlayType('application/vnd.apple.mpegurl')) {
         videoRef.current.src = `${BACKEND_URL}/hls/manifest.m3u8`
         setAttached(true)
@@ -109,8 +111,12 @@ export default function Page() {
       try {
         const msg = JSON.parse(ev.data)
         if (msg.type === 'video_segment') {
-          appendLog(`Segment #${msg.index} ready: ${msg.uri}`)
-          if (!attached) attachHls()
+          const idx = msg.index !== undefined ? msg.index : '?'
+          appendLog(`Segment #${idx} ready: ${msg.uri}`)
+          if (!attachedRef.current) {
+            attachHls()
+            // attachedRef.current will be set true inside attachHls
+          }
         } else if (msg.type === 'status') {
           appendLog(`Status: ${msg.stage}`)
           // reflect idle state reported from server
@@ -133,7 +139,10 @@ export default function Page() {
       setWsStatus('closed')
       appendLog('WS closed')
     }
-    return () => ws.close()
+    return () => {
+      ws.close()
+      attachedRef.current = false
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mockMode])
 
@@ -164,6 +173,7 @@ export default function Page() {
       videoRef.current.play().catch(() => { })
     } else {
       setAttached(false)
+      attachedRef.current = false
       videoRef.current.src = ''
     }
 
