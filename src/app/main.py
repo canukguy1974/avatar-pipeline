@@ -264,7 +264,7 @@ class HLSManager:
                 # AND jump to the latest available idle segment to avoid manifest timeline spam
                 if self.hls._current_source != "idle":
                     print("DEBUG: [HLSManager] Returning to IDLE source, jumping to latest", flush=True)
-                    self.hls.switch_source("idle", force=True)
+                    self.hls.switch_source("idle", force=True, clear_buffer=True)
                     
                     # CATCH UP: Skip segments we missed while live
                     all_segs = sorted([f for f in os.listdir(HLS_DIR) if f.startswith("idle_") and f.endswith(".m4s")])
@@ -566,20 +566,19 @@ class Session:
     async def _remux_mp4_to_m4s(self, src_mp4: Path, dst_m4s: Path, init_map_path: Path):
         dst_m4s.parent.mkdir(parents=True, exist_ok=True)
         cwd = dst_m4s.parent
+        is_ts = src_mp4.suffix.lower() == ".ts"
         
         # We use a robust fragmented MP4 creation command.
-        # If the init file doesn't exist, we create it.
-        # Otherwise, we just create the segment.
-        
         flags = "frag_keyframe+empty_moov+default_base_moof"
+        bsf = ["-bsf:a", "aac_adtstoasc"] if is_ts else []
+        
         if not init_map_path.exists():
              # Create BOTH init and first segment
-             # Using -map 0 ensures we map all streams from input.
              cmd = [
                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                  "-i", str(src_mp4),
-                 "-map", "0",
-                 "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                 "-map", "0:v", "-map", "0:a",
+                 "-c:v", "copy", "-c:a", "copy", *bsf,
                  "-f", "mp4", "-movflags", flags,
                  str(dst_m4s)
              ]
@@ -591,8 +590,8 @@ class Session:
              init_cmd = [
                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                  "-i", str(src_mp4),
-                 "-map", "0",
-                 "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                 "-map", "0:v", "-map", "0:a",
+                 "-c:v", "copy", "-c:a", "copy", *bsf,
                  "-f", "hls", "-hls_time", "999", "-hls_segment_type", "fmp4",
                  "-hls_fmp4_init_filename", init_map_path.name,
                  "-hls_segment_filename", "tmp_init_remux_%d.m4s",
@@ -614,8 +613,8 @@ class Session:
             cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                 "-i", str(src_mp4),
-                "-map", "0",
-                "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                "-map", "0:v", "-map", "0:a",
+                "-c:v", "copy", "-c:a", "copy", *bsf,
                 "-f", "mp4", "-movflags", flags,
                 str(dst_m4s)
             ]
@@ -685,7 +684,7 @@ class Session:
             self._live_started = True 
             hls_manager.live_sessions.add(self.session_id)
             self.hls.force_discontinuity()
-            self.hls.switch_source("live_test")
+            self.hls.switch_source("live_test", clear_buffer=True)
             
             # Find available test segments
             ts_files = sorted([f for f in os.listdir(HLS_DIR) if f.startswith("segment_") and f.endswith(".ts")])
@@ -722,9 +721,13 @@ class Session:
             print(f"ERROR: run_fake_live_test failed: {e}", flush=True)
         finally:
             self._test_running = False
-            # Only release global live lock if the chat video loop isn't also live
+            # If we are silent and not live in chat, release the global lock
             if not self._live_started:
                 hls_manager.live_sessions.discard(self.session_id)
+            else:
+                 # Even if we WERE live in chat, we should probably switch source back to live if chat is still going
+                 # But for now, we just let the idle loop return if ALL sessions are done.
+                 pass
             
             hls_manager.ensure_idle_loop()
             print(f"DEBUG: run_fake_live_test finished for session {self.session_id}", flush=True)

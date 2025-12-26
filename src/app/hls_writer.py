@@ -101,10 +101,14 @@ class HLSWriter:
     def force_discontinuity(self):
         self._pending_discontinuity = True
 
-    def switch_source(self, new_source: str, *, force: bool = False):
+    def switch_source(self, new_source: str, *, force: bool = False, clear_buffer: bool = False):
         if force or new_source != self._current_source:
             self._current_source = new_source
             self._pending_discontinuity = True
+            if clear_buffer:
+                print(f"DEBUG: [HLSWriter] Clearing segment buffer for source switch to {new_source}", flush=True)
+                self._segments = []
+                self._pending_discontinuity = True # Re-ensure for first new segment
 
     def start_idle_segmentation(self, idle_mp4: Path):
         self.hls_dir.mkdir(parents=True, exist_ok=True)
