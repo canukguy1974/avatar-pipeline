@@ -261,9 +261,18 @@ class HLSManager:
                     continue
                 
                 # If we just came back from live, we should force a source switch to idle
+                # AND jump to the latest available idle segment to avoid manifest timeline spam
                 if self.hls._current_source != "idle":
-                    print("DEBUG: [HLSManager] Returning to IDLE source", flush=True)
+                    print("DEBUG: [HLSManager] Returning to IDLE source, jumping to latest", flush=True)
                     self.hls.switch_source("idle", force=True)
+                    
+                    # CATCH UP: Skip segments we missed while live
+                    all_segs = sorted([f for f in os.listdir(HLS_DIR) if f.startswith("idle_") and f.endswith(".m4s")])
+                    if all_segs:
+                        latest_idx = int(all_segs[-1].split("_")[1].split(".")[0])
+                        if latest_idx > self.current_seq:
+                            print(f"DEBUG: Catching up idle sequence: {self.current_seq} -> {latest_idx}", flush=True)
+                            self.current_seq = latest_idx
 
                 seg_name = f"idle_{self.current_seq:06d}.m4s"
                 seg_path = HLS_DIR / seg_name
@@ -508,6 +517,7 @@ class Session:
         self.session_id = str(uuid.uuid4())[:8]
         self.hls = hls_manager.hls
         self._live_started = False
+        self._test_running = False
 
     async def run(self):
         print(f"DEBUG: [Session {self.session_id}] run() starting", flush=True)
@@ -712,8 +722,10 @@ class Session:
             print(f"ERROR: run_fake_live_test failed: {e}", flush=True)
         finally:
             self._test_running = False
-            self._live_started = False
-            hls_manager.live_sessions.discard(self.session_id)
+            # Only release global live lock if the chat video loop isn't also live
+            if not self._live_started:
+                hls_manager.live_sessions.discard(self.session_id)
+            
             hls_manager.ensure_idle_loop()
             print(f"DEBUG: run_fake_live_test finished for session {self.session_id}", flush=True)
 
