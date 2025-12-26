@@ -567,27 +567,29 @@ class Session:
              cmd = [
                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                  "-i", str(src_mp4),
-                 "-c", "copy",
+                 "-c", "copy", "-bsf:a", "aac_adtstoasc",
                  "-f", "mp4", "-movflags", flags,
-                 "-hls_segment_type", "fmp4", # not strictly needed for direct mp4 output but good context
                  str(dst_m4s)
              ]
-             proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd))
-             await proc.wait()
+             proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+             stdout, stderr = await proc.communicate()
+             if proc.returncode != 0:
+                 print(f"ERROR: ffmpeg failed (init/segment): {stderr.decode()}", flush=True)
              
-             # Extract the init part. A simple way is using -f hls briefly or manual extract.
-             # Actually, simpler: use -f hls for the FIRST segment to get both.
              init_cmd = [
                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                  "-i", str(src_mp4),
-                 "-c", "copy",
+                 "-c", "copy", "-bsf:a", "aac_adtstoasc",
                  "-f", "hls", "-hls_time", "999", "-hls_segment_type", "fmp4",
                  "-hls_fmp4_init_filename", init_map_path.name,
                  "-hls_segment_filename", "tmp_init_remux_%d.m4s",
                  "tmp_init.m3u8"
              ]
-             proc = await asyncio.create_subprocess_exec(*init_cmd, cwd=str(cwd))
-             await proc.wait()
+             proc = await asyncio.create_subprocess_exec(*init_cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+             stdout, stderr = await proc.communicate()
+             if proc.returncode != 0:
+                 print(f"ERROR: ffmpeg failed (init cmd): {stderr.decode()}", flush=True)
+
              # Rename the first segment to target
              if (cwd / "tmp_init_remux_0.m4s").exists():
                  (cwd / "tmp_init_remux_0.m4s").replace(dst_m4s)
@@ -596,16 +598,17 @@ class Session:
                  (cwd / "tmp_init.m3u8").unlink()
         else:
             # Just create the segment, ensuring it's fragmented
-            # We use -f mp4 with fragmentation flags; HLS.js handles this fine as an .m4s
             cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                 "-i", str(src_mp4),
-                "-c", "copy",
+                "-c", "copy", "-bsf:a", "aac_adtstoasc",
                 "-f", "mp4", "-movflags", flags,
                 str(dst_m4s)
             ]
-            proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd))
-            await proc.wait()
+            proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                print(f"ERROR: ffmpeg failed (segment only): {stderr.decode()}", flush=True)
 
     async def _get_media_duration(self, file_path: Path) -> float:
         try:
