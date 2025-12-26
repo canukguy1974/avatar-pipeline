@@ -6,6 +6,7 @@
 > 2. **Update Always**: After implementing significant changes (architectures, new services, bug fixes), update the relevant sections of this file.
 > 3. **Preserve "Why"**: Don't just document *what* changed, but *why* it was changed to prevent regressing on past decisions.
 > 4. **No Placeholders**: Never use placeholder descriptions; ensure technical details are accurate and derived from the source code.
+> 5. **Exercise Production Invariants**: If the production invariant is the thing under test, then the test must exercise the production invariant.
 
 This file serves as a persistent technical memory for the project. It describes the "why" and "how" of the current implementation, key architectural decisions, and operational safety measures.
 
@@ -43,50 +44,45 @@ graph TD
 ### 4. Video Worker (`/InfiniteTalk/workers/video`)
 - **Input**: Listens to Redis Stream `audio_windows`.
 - **Processing**: Runs `generate_infinitetalk.py` (GPU/ML).
-- **Output**: Publishes to Redis Stream `mp4_ready` and saves to `output/`.
-- **Cleanup**: Retains only the 5 most recent generated videos to save space.
+- **Communication**: Redis `result:{job_id}` keys are used for status polling by the API.
+- **Output**: Shared volume `/app/output` ensures the API can access generated `.mp4` files for remuxing.
 
-## � Redis Event Mapping
+## 🔗 Redis Event Mapping
 
-| Stream          | Producer            | Consumer            | Data Payload                               |
-| :-------------- | :------------------ | :------------------ | :----------------------------------------- |
-| `audio_windows` | Backend (`Session`) | Video Worker        | `{job_id, input_data: {audio_path}, args}` |
-| `mp4_ready`     | Video Worker        | Backend (`Session`) | `{job_id, video_path}`                     |
+| Stream            | Producer            | Consumer            | Data Payload                               |
+| :---------------- | :------------------ | :------------------ | :----------------------------------------- |
+| `audio_windows`   | Backend (`Session`) | Video Worker        | `{job_id, input_data: {audio_path}, args}` |
+| `result:{job_id}` | Video Worker        | Backend (`Session`) | Video status and output path               |
 
 ## 🛡️ Safety & Testing Controls
 
 | Variable           | Description                                                                                        |
 | :----------------- | :------------------------------------------------------------------------------------------------- |
 | `ALLOW_GENERATION` | Must be `true` for the worker to run real ML processing.                                           |
-| `DRY_RUN`          | If `true`, the worker skips subprocess calls but acknowledges messages.                            |
 | `FAKE_RUN`         | If `true`, the worker copies `idle_loop.mp4` to the output to verify the full pipeline end-to-end. |
-| `USE_STUBS`        | If `1`, the backend uses mock data for some services.                                              |
 
 ## 📼 HLS Streaming Mechanics
 
-- **Initialization**: `init.mp4` contains the fMP4 header metadata.
+- **Initialization**: `init.mp4` (idle) and `live_init_{session_id}.mp4` (live) contain the fMP4 headers.
 - **File Naming**:
-    - Idle: `idle_XXXXXX.m4s` (generated once/looped).
-    - Live: `seg_XXXX.m4s` (unique per session/sequence).
-- **Manifest Sync**: `manifest.m3u8` must strictly mirror the authoritative `idle.m3u8` during idle periods:
-    - **Sequence**: `#EXT-X-MEDIA-SEQUENCE` must match the source (FFmpeg often starts at high numbers).
-    - **Target Duration**: Must be `>=` any segment (e.g., 6s for FFmpeg defaults).
-    - **Discontinuities**: `#EXT-X-DISCONTINUITY` and `#EXT-X-DISCONTINUITY-SEQUENCE` are required for looping fMP4 content with resetting timestamps.
-- **Atomic Updates**: `manifest.m3u8` is written to a `.tmp` file first and then atomically renamed.
-- **Directory Invariants**: `HLS_DIR`, `AUDIO_DIR`, and `STATIC_DIR` must be shared/mirrored between Backend and Worker if they run on different hosts/containers.
+    - Idle: `idle_XXXXXX.m4s` (global/persistent).
+    - Live: `seg_{session_id}_XXXX.m4s` (unique per session to prevent collisions).
+- **Manifest Sync**:
+    - **Isolation**: `HLSManager` tracks active live sessions via a registry. The idle loop is strictly paused when any live session is active.
+    - **Durations**: `ffprobe` is used to detect the **actual** duration of each segment before adding it to the manifest, ensuring player buffer stability.
+    - **Window Size**: Increased to **120 segments (~6 minutes)** and the FFmpeg buffer to **300 segments** to provide headroom for player catch-up and catch 404s.
+    - **Idempotency**: `HLSWriter` ignores duplicate segment additions to prevent manifest corruption during sync-loop restarts.
+    - **Source Transitions**: Always forces a source reset to `idle` when live sessions end, ensuring a clean jump via discontinuity.
+- **Atomic Updates**: `manifest.m3u8` is updated via temp-file rename to prevent corruption.
 
 ## ⚠️ Known Gotchas & Patterns
 
-1. **Duplicate Env Vars**: Ensure `.env` does not have duplicate `HLS_DIR` entries (common cause of segments staying "stuck" in one folder while the API looks at another).
-2. **Path Resolution**: Use absolute paths in `.env` to avoid `FileNotFoundError` when workers run from different CWDs.
-3. **FFmpeg Imports**: `HLSWriter` requires `contextlib` for suppressed error handling during manifest writes.
-4. **WebSocket Blocking**: Avoid heavy CPU tasks in the FastAPI WS handler; offload to the Redis/Worker pipeline.
-5. **Singleton HLS**: Replacing the `<video>` element's `src` while an HLS instance is attached causes standard MediaSource errors. Always `hls.destroy()` before switching modes. Use an `attachedRef` in the frontend to prevent redundant attachments caused by WebSocket state flickering.
-6. **Sliding Window vs Event**: `HLSWriter` must have `delete_old=True` to be a true "Sliding Window". `EXT-X-PLAYLIST-TYPE:EVENT` should only be used if `delete_old=False` (growing playlist). Mixing them causes playback stalls.
-7. **HLS Segment Gaps**: The idle video mechanism produces `idle_*.m4s` files. If there are gaps in the sequence (e.g. `idle_01`, `idle_03`), the server loop (`_seed_idle_until_live`) must actively detect and jump over them, otherwise it stalls waiting for the missing segment.
-8. **WebSocket Lifecycle**: The `manifest.m3u8` is NOT updated unless a client session is active. `Session.run()` must await `recv_task` to keep the loop running.
-9. **Manifest Sync Wall**: If the `manifest.m3u8` is missing `#EXT-X-MEDIA-SEQUENCE` or has a `TARGETDURATION` lower than the actual media (e.g. 3s target vs 6s media), players will "hit a wall" at ~24-30s and stall.
-10. **State Stale Closures**: WebSocket `onmessage` handlers in React can capture old state. Use `useRef` for values like `attached` to ensure the handler sees the latest status and doesn't trigger redundant logic (like Hls re-initialization).
+1. **Session Timeline Collisions**: If multiple users or page refreshes use the same segment names (e.g. `seg_0000.m4s`), the HLS timeline will corrupt. **Fix**: Use session-unique naming and individual `live_init` files.
+2. **Buffer Append Errors**: Often caused by a mismatch between the manifest `#EXTINF` duration and the actual file duration. **Fix**: Always probe the file with `ffprobe` instead of assuming a constant duration.
+3. **Idle Loop Interference**: If the background sync loop adds idle segments while a live stream is pushing its own, the sequence will interleave and crash the player. **Fix**: Implement a global `live_sessions` registry to gate the idle loop.
+4. **Shared Volume Paths**: Workers and API must agree on absolute paths in the shared volumes (e.g. `/app/output`). Relative paths will fail across container boundaries.
+5. **Manifest sequence mismatch**: If the media sequence doesn't match the first file in the window, players will 404. `HLSManager` must re-sync `_media_sequence` if it detects a gap.
+6. **Post-Live Cleanup**: Always ensure `live_sessions` is cleared in a `finally` block to allow the idle loop to resume after errors or closures.
 
 ## 🛠️ Operations & Setup
 

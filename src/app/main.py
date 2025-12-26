@@ -13,6 +13,9 @@ import time
 from pathlib import Path
 import wave, io, struct
 import subprocess
+import shutil
+import uuid
+import redis
 from shutil import which
 from app.hls_writer import HLSWriter
 from app.controller import run_controller
@@ -43,12 +46,12 @@ APP_DIR  = Path(__file__).resolve().parent          # .../src/app
 SRC_DIR  = APP_DIR.parent                            # .../src
 ROOT_DIR = SRC_DIR.parent 
 BASE_DIR = SRC_DIR
-USE_STUBS = os.getenv("USE_STUBS", "1") == "1"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 STATIC_DIR = Path(os.getenv("STATIC_DIR", SRC_DIR / "static"))
 HLS_DIR = Path(os.getenv("HLS_DIR", "/app/src/hls"))
-AUDIO_DIR  = Path(os.getenv("AUDIO_DIR",  "/app/src/audio"))
+AUDIO_DIR  = Path(os.getenv("AUDIO_DIR",  "/app/audio"))
+OUTPUT_DIR = Path("/app/output")
 SEG_LEN_MS = int(os.getenv("AVATAR_SEG_MS", "1800"))
 SEG_OVERLAP_MS = int(os.getenv("AVATAR_SEG_OVERLAP_MS", "250"))
 INFINITETALK_BIN = os.getenv("INFINITETALK_BIN", "infinitetalk")
@@ -58,50 +61,258 @@ IDLE_LOOP_MP4 = Path(os.getenv("IDLE_LOOP_MP4", HLS_DIR / "idle_loop.mp4"))
 # Bootstrap manifest for initial client connection
 BOOTSTRAP_MANIFEST = HLS_DIR / "manifest_bootstrap.m3u8"
 
+# Redis Setup
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+AUDIO_STREAM = "audio_windows"
+
+try:
+    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    redis_client.ping()
+    print(f"DEBUG: Connected to Redis at {REDIS_HOST}:{REDIS_PORT}", flush=True)
+except Exception as e:
+    print(f"ERROR: Redis connection failed: {e}", flush=True)
+    redis_client = None
+
+async def delegate_video_generation(audio_wav: Path) -> Path:
+    """Delegates ML video generation to the worker via Redis."""
+    if redis_client is None:
+        raise RuntimeError("Redis not available for delegation")
+
+    job_id = f"job_{uuid.uuid4().hex[:8]}_{int(time.time())}"
+    
+    # Prepare message for video_worker.py
+    job_msg = {
+        "job_id": job_id,
+        "input_data": {
+            "prompt": "Live Avatar Animation",
+            "cond_video": REF_IMAGE_ABS,
+            "cond_audio": {
+                "person1": str(audio_wav)
+            }
+        },
+        "args": {
+            "size": "infinitetalk-480",
+            "motion_frame": 9,
+            "frame_num": 81,
+            "sample_shift": 7.0,
+            "sd_steps": 8,
+            "text_guide_scale": 1.0,
+            "audio_guide_scale": 1.0,
+            "seed": 42,
+            "task": "infinitetalk-14B",
+            "ulysses_size": 1,
+            "ring_size": 1,
+            "color_correction_strength": 1.0
+        }
+    }
+
+    # Worker expects {'data': <job_as_json>}
+    redis_client.xadd(AUDIO_STREAM, {"data": json.dumps(job_msg)})
+    print(f"DEBUG: Dispatched job {job_id} to Redis stream {AUDIO_STREAM}", flush=True)
+
+    # Poll for result (video_worker writes results to f"result:{job_id}")
+    result_key = f"result:{job_id}"
+    max_wait = 60 # worker might take time
+    start = time.time()
+    while time.time() - start < max_wait:
+        res = redis_client.get(result_key)
+        if res:
+            # Result path is absolute inside container, e.g. /app/output/...
+            return Path(res)
+        await asyncio.sleep(0.5)
+
+    raise TimeoutError(f"Video generation timed out for job {job_id}")
+
 
 
 HLS_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Global idle segmentation process (persistent across WebSocket sessions)
-_global_idle_proc = None
-_global_hls_writer = None
-_global_live_active = False
+# HLS Manager: Singleton to handle manifest updates and idle synchronization for ALL sessions
+class HLSManager:
+    def __init__(self):
+        print(f"DEBUG: HLSManager initializing. HLS_DIR={HLS_DIR}", flush=True)
+        # FORCE RESET of the main manifest to avoid old live references
+        with contextlib.suppress(Exception): (HLS_DIR / "manifest.m3u8").unlink()
+        self.hls = HLSWriter(HLS_DIR, window=120, default_td=6.0, delete_old=True)
+        self.idle_task: Optional[asyncio.Task] = None
+        self.live_sessions = set() # Set of session IDs (strings)
+        self.sessions = set() # Set of Session objects
+        self.current_seq = 0
+        self._init_done = False # Track if live_init.mp4 is already generated
 
-# Registry of active session objects (for debug/test triggers)
-_active_sessions = set()
+        # PURGE ALL LIVE ARTIFACTS ON STARTUP to avoid stalled buffers
+        print(f"DEBUG: Purging stale live files in {HLS_DIR}", flush=True)
+        for p in HLS_DIR.glob("seg_*.m4s"):
+            with contextlib.suppress(Exception): p.unlink()
+        for p in HLS_DIR.glob("live_*.m4s"):
+            with contextlib.suppress(Exception): p.unlink()
+        with contextlib.suppress(Exception): (HLS_DIR / "live_init.mp4").unlink()
+        self._init_done = False # Track if live_init.mp4 is already generated
 
-def set_global_live_active(state: bool):
-    global _global_live_active
-    _global_live_active = state
-    print(f"DEBUG: GLOBAL_LIVE_ACTIVE set to {state}", flush=True)
+    @property
+    def live_active(self):
+        active = len(self.live_sessions) > 0
+        return active
 
-def is_global_live_active() -> bool:
-    return _global_live_active
+    def register_session(self, session):
+        self.sessions.add(session)
+        # On first session, or if idle died, start it
+        if not self.live_active:
+            self.ensure_idle_loop()
+            
+    def unregister_session(self, session):
+        self.sessions.discard(session)
 
-def _init_global_idle():
-    """Initialize the global idle FFmpeg process at startup (called once)."""
-    global _global_idle_proc, _global_hls_writer
-    print(f"DEBUG: HLS_DIR = {HLS_DIR}", flush=True)
-    print(f"DEBUG: IDLE_LOOP_MP4 = {IDLE_LOOP_MP4}", flush=True)
-    print(f"DEBUG: IDLE_LOOP_MP4.exists() = {IDLE_LOOP_MP4.exists()}", flush=True)
-    
-    if _global_idle_proc is not None:
-        return  # Already running
-    
-    print(f"DEBUG: Initializing global idle FFmpeg", flush=True)
-    _global_hls_writer = HLSWriter(HLS_DIR, window=20, default_td=3.0, delete_old=True)
-    
-    if IDLE_LOOP_MP4.exists():
+    def ensure_idle_loop(self):
+        # Trigger the actual FFmpeg process
+        if IDLE_LOOP_MP4.exists():
+            self.hls.start_idle_segmentation(IDLE_LOOP_MP4)
+        
+        if self.idle_task and not self.idle_task.done():
+            return
+        self.idle_task = asyncio.create_task(self._sync_idle_cycle())
+        print("DEBUG: Master HLSManager idle loop started", flush=True)
+
+    async def broadcast(self, msg: dict):
+        # Send a message to all active WebSocket sessions
+        dead = []
+        for s in self.sessions:
+            try:
+                if s.alive:
+                    await s.ws.send_json(msg)
+                else:
+                    dead.append(s)
+            except Exception:
+                dead.append(s)
+        for d in dead:
+            self.sessions.discard(d)
+
+    async def _sync_idle_cycle(self):
+        """Master loop that heartbeats with idle.m3u8 and updates manifest.m3u8"""
+        print("DEBUG: _sync_idle_cycle TASK STARTED", flush=True)
         try:
-            _global_hls_writer.start_idle_segmentation(IDLE_LOOP_MP4)
-            _global_idle_proc = _global_hls_writer._idle_proc
-            print(f"DEBUG: Global idle FFmpeg started (PID: {_global_idle_proc.pid})", flush=True)
+            # Helper to parse FFmpeg's idle.m3u8
+            def parse_idle_manifest():
+                d_map = {}
+                seq = 0
+                try:
+                    p = HLS_DIR / "idle.m3u8"
+                    if p.exists():
+                        print(f"DEBUG: Parsing {p}", flush=True)
+                        lines = p.read_text(encoding="utf-8").splitlines()
+                        for i, line in enumerate(lines):
+                            line = line.strip()
+                            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                                try: seq = int(line.split(":")[1])
+                                except: pass
+                            if line.endswith(".m4s"):
+                                seg_key = os.path.basename(line)
+                                if i > 0 and lines[i-1].startswith("#EXTINF:"):
+                                    try:
+                                        dur_str = lines[i-1].split(":")[1].split(",")[0]
+                                        d_map[seg_key] = float(dur_str)
+                                    except: pass
+                except Exception as e:
+                    print(f"DEBUG: parse_idle_manifest failed: {e}", file=sys.stderr)
+                return seq, d_map
+
+            # ENSURE we start in idle mode if no live sessions
+            if not self.live_active:
+                self.hls.switch_source("idle")
+
+            # Initial Sync
+            _, dur_map = parse_idle_manifest()
+            if dur_map:
+                current_idle_segs = list(dur_map.keys())
+                # The FIRST segment in our window must match the MEDIA-SEQUENCE.
+                # If we show window size=20, we take the last 20.
+                window_segs = current_idle_segs[-self.hls.window:]
+                if window_segs:
+                    # Sync media sequence to the numeric index of the first segment in our window
+                    first_seg_name = window_segs[0]
+                    self.hls._media_sequence = int(first_seg_name.split("_")[1].split(".")[0])
+                    
+                    for sname in window_segs:
+                        sdur = dur_map[sname]
+                        self.hls.add_segment(sname, sdur, map_file="init.mp4", delete_old=False)
+                    
+                    last_name = window_segs[-1]
+                    self.current_seq = int(last_name.split("_")[1].split(".")[0]) + 1
+            else:
+                self.current_seq = 0
+
+            # Permanent loop
+            print(f"DEBUG: Entering permanent idle loop. current_seq={self.current_seq}", flush=True)
+            while True:
+                if self.live_active:
+                    # While live is active, we just wait. 
+                    # When it flips back to False, we'll hit the 'else' block below or next iteration.
+                    await asyncio.sleep(1.0)
+                    continue
+                
+                # If we just came back from live, we should force a source switch to idle
+                if self.hls._current_source != "idle":
+                    print("DEBUG: [HLSManager] Returning to IDLE source", flush=True)
+                    self.hls.switch_source("idle", force=True)
+
+                seg_name = f"idle_{self.current_seq:06d}.m4s"
+                seg_path = HLS_DIR / seg_name
+                
+                if seg_path.exists():
+                    print(f"DEBUG: Found idle segment {seg_name}", flush=True)
+                    _, dur_map = parse_idle_manifest()
+                    actual_dur = dur_map.get(seg_name, 6.0) 
+                    self.hls.add_segment(seg_name, actual_dur, map_file="init.mp4", delete_old=False)
+                    # Notify everyone
+                    await self.broadcast({
+                        "type": "video_segment",
+                        "uri": f"/hls/{seg_name}",
+                        "dur": actual_dur,
+                        "index": self.current_seq,
+                        "source": "idle"
+                    })
+                    print(f"DEBUG: Broadcasted {seg_name}, Next Seq: {self.current_seq + 1}", flush=True)
+                    self.current_seq += 1
+                else:
+                    # Look for jumps
+                    all_segs = sorted([f for f in os.listdir(HLS_DIR) if f.startswith("idle_") and f.endswith(".m4s")])
+                    future = [int(f.split("_")[1].split(".")[0]) for f in all_segs if int(f.split("_")[1].split(".")[0]) > self.current_seq]
+                    if future:
+                        old_seq = self.current_seq
+                        self.current_seq = min(future)
+                        print(f"DEBUG: Idle sync jump: {old_seq} -> {self.current_seq}", flush=True)
+                        continue
+                    
+                    if not all_segs:
+                        # Maybe FFmpeg hasn't started writing yet?
+                        pass
+                    else:
+                        last_exist_idx = int(all_segs[-1].split("_")[1].split(".")[0])
+                        if self.current_seq > last_exist_idx + 1:
+                            # We are significantly ahead, maybe FFmpeg restarted?
+                            self.current_seq = last_exist_idx
+                            print(f"DEBUG: Idle sync reset to tail: {self.current_seq}", flush=True)
+                        elif self.current_seq < last_exist_idx:
+                            # We are behind but jump logic above didn't catch it?
+                            # This shouldn't normally happen if future jump works.
+                            pass
+                    
+                    await asyncio.sleep(1.0) # Wait for FFmpeg to produce next segment
+
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            print(f"DEBUG: Failed to start global idle FFmpeg: {e}", flush=True)
-    else:
-        print(f"DEBUG: Idle loop file not found: {IDLE_LOOP_MP4}", flush=True)
+            print(f"ERROR: HLSManager sync cycle crashed: {e}", file=sys.stderr)
+            await asyncio.sleep(2.0)
+            self.idle_task = None
+            self.ensure_idle_loop()
+
+# Global Singleton
+hls_manager = HLSManager()
 
 def _create_bootstrap_manifest():
     """Create a minimal HLS manifest for initial client connection."""
@@ -117,13 +328,8 @@ _create_bootstrap_manifest()
 def _abs(p: Path | str) -> str:
     return str((Path(p).resolve() if isinstance(p, (str, Path)) else p))
 
-def preflight_or_idle():
+def preflight_check():
     problems = []
-
-    # Binary
-    from shutil import which
-    if which(INFINITETALK_BIN) is None:
-        problems.append(f"INFINITETALK_BIN not found on PATH: {INFINITETALK_BIN}")
 
     # Ref image (make absolute)
     ref_guess = (STATIC_DIR / Path(REF_IMAGE).name) if not Path(REF_IMAGE).is_absolute() else Path(REF_IMAGE)
@@ -132,14 +338,14 @@ def preflight_or_idle():
 
     return problems, _abs(ref_guess)
 
-PREFLIGHT_ISSUES, REF_IMAGE_ABS = preflight_or_idle()
+PREFLIGHT_ISSUES, REF_IMAGE_ABS = preflight_check()
 
 app = FastAPI(title="Live Avatar Scaffold")
 
 @app.on_event("startup")
 async def startup():
-    """Initialize global idle FFmpeg at server startup."""
-    _init_global_idle()
+    """Initialize master HLS singleton at server startup."""
+    hls_manager.ensure_idle_loop()
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -200,61 +406,47 @@ async def test_live():
 
 @app.post("/debug/attach-live")
 async def attach_live_test():
-    """Manually trigger the Fake Live Test on the active session."""
-    session_count = len(_active_sessions)
-    if session_count == 0:
+    """Manually trigger the Fake Live Test on the active sessions."""
+    if not hls_manager.sessions:
         return {"status": "error", "message": "No active WebSocket session found. Keep frontend open."}
 
     triggered = 0
-    for sess in list(_active_sessions):
+    for sess in list(hls_manager.sessions):
         try:
-            print(f"DEBUG: Triggering fake live test on session {sess}", flush=True)
+            print(f"DEBUG: Triggering fake live test on session {sess.session_id}", flush=True)
             asyncio.create_task(sess.run_fake_live_test())
             triggered += 1
         except Exception as e:
-            print(f"ERROR: Failed to trigger test on session: {e}", flush=True)
+            print(f"ERROR: Failed to trigger test on session {sess.session_id}: {e}", flush=True)
 
     return {"status": "triggered", "sessions_triggered": triggered}
 
 
 
 @app.websocket("/session")
-async def session(ws: WebSocket):
-    """WebSocket endpoint for frontend sessions.
+async def websocket_endpoint(ws: WebSocket):
+    """
     Accepts the connection, ensures the global idle FFmpeg is running,
     then creates a Session() and runs it.
     """
     await ws.accept()
     print("DEBUG: WebSocket accepted", flush=True)
 
-    # Ensure global idle process is running
-    _init_global_idle()
-
-    # Use the global HLS writer if available
-    hls = _global_hls_writer if _global_hls_writer else HLSWriter(HLS_DIR, window=20, default_td=3.0, delete_old=True)
-    print(f"DEBUG: Using HLS writer (default_td={hls.default_td})", flush=True)
-
-    # Wait briefly for manifest/init files to appear
-    manifest_path = HLS_DIR / "idle.m3u8"
-    init_path = HLS_DIR / "init.mp4"
-    max_wait = 50
-    for attempt in range(max_wait):
-        if manifest_path.exists() and init_path.exists():
-            print(f"DEBUG: Manifest and init ready after {(attempt+1)*100}ms", flush=True)
-            break
-        await asyncio.sleep(0.1)
-
-    if not manifest_path.exists():
-        print("DEBUG: Manifest still not ready after wait", flush=True)
-
-    await ws.send_json({"type": "status", "stage": "idle_setup", "note": "Idle loop ready"})
-
-    sess = Session(ws, hls)
-    print("DEBUG: Creating Session", flush=True)
     try:
+        # Register session for global broadcasts
+        print("DEBUG: Initializing Session object...", flush=True)
+        sess = Session(ws)
+        print(f"DEBUG: Session {sess.session_id} created, registering...", flush=True)
+        hls_manager.register_session(sess)
+        
+        print(f"DEBUG: Starting sess.run() for {sess.session_id}", flush=True)
         await sess.run()
     except Exception as e:
-        print(f"DEBUG: session run error: {e}", flush=True)
+        print(f"DEBUG: websocket_endpoint exception: {e}", flush=True)
+    finally:
+        if 'sess' in locals():
+            print(f"DEBUG: Unregistering session {sess.session_id}", flush=True)
+            hls_manager.unregister_session(sess)
 
 class RollingWav:
     def __init__(self, out_dir: Path, seg_ms: int, overlap_ms: int, sr=16000):
@@ -302,450 +494,274 @@ class RollingWav:
 
         
 class Session:
-    def __init__(self, ws: WebSocket, hls: HLSWriter):
+    def __init__(self, ws: WebSocket):
         self.ws = ws
-        self.hls = hls
-        self.roller = RollingWav(AUDIO_DIR, SEG_LEN_MS, SEG_OVERLAP_MS)
+        self.roller = RollingWav(out_dir=AUDIO_DIR, seg_ms=SEG_LEN_MS, overlap_ms=SEG_OVERLAP_MS)
         self.seg_counter = 0
         self.alive = True
+        self.session_id = str(uuid.uuid4())[:8]
+        self.hls = hls_manager.hls
         self._live_started = False
-        _active_sessions.add(self)
-        print(f"DEBUG: Session registered. Active sessions: {len(_active_sessions)}", flush=True)
-
-    async def _seed_idle_until_live(self):
-        """Read the files created by start_idle_segmentation() and feed them until live begins."""
-        import sys
-        print(f"DEBUG: _seed_idle_until_live started", file=sys.stderr)
-        try:
-            self.hls.switch_source("idle")
-            idle_segment_duration = 3.0  # Match FFmpeg -hls_time setting (approx)
-            
-            # Find any available segments
-            import os
-            def get_segments():
-                return sorted([f for f in os.listdir(HLS_DIR) if f.startswith("idle_") and f.endswith(".m4s")])
-
-            existing_segments = get_segments()
-            print(f"DEBUG: Found {len(existing_segments)} idle segments", file=sys.stderr)
-            
-            # Wait a bit if none found initially
-            if not existing_segments:
-                await asyncio.sleep(1.0)
-                existing_segments = get_segments()
-                print(f"DEBUG: After wait, found {len(existing_segments)} idle segments", file=sys.stderr)
-            
-            if not existing_segments:
-                print(f"DEBUG: No idle segments available, waiting...", file=sys.stderr)
-                await self.ws.send_json({"type": "status", "note": "Waiting for idle segments..."})
-                # Don't return, just enter the loop and hope they show up or just retry init logic
-                # Actually, let's just proceed to loop, but we need a current_seq.
-                # If we don't have segments, we can't determine current_seq. 
-                # Let's wait in a loop here.
-                while not existing_segments and self.alive:
-                    await asyncio.sleep(1.0)
-                    existing_segments = get_segments()
-                    if existing_segments: break
-                    print("DEBUG: Still waiting for segments...", file=sys.stderr)
-            
-            # Start from a recent segment to avoid playing ancient history or getting stuck in gaps too far back.
-            # If we have many segments, start from the last 5 or so.
-            start_index = 0
-            if len(existing_segments) > 6:
-                start_index = len(existing_segments) - 6
-            
-            first_seg_name = existing_segments[start_index]
-            current_seq = int(first_seg_name.split("_")[1].split(".")[0])
-            print(f"DEBUG: Starting from segment sequence {current_seq} ({first_seg_name})", file=sys.stderr)
-            
-            # Continuous streaming loop
-            # Continuous streaming loop
-            resumed_from_wait = False
-            
-            def parse_idle_manifest():
-                """Parse idle.m3u8 for sequence and durations."""
-                d_map = {}
-                seq = 0
-                try:
-                    p = HLS_DIR / "idle.m3u8"
-                    if p.exists():
-                        text = p.read_text(encoding="utf-8")
-                        lines = text.splitlines()
-                        for i, line in enumerate(lines):
-                            line = line.strip()
-                            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-                                try: seq = int(line.split(":")[1])
-                                except: pass
-                            if line.endswith(".m4s"):
-                                seg_key = os.path.basename(line)
-                                if i > 0 and lines[i-1].startswith("#EXTINF:"):
-                                    try:
-                                        dur_str = lines[i-1].split(":")[1].split(",")[0]
-                                        d_map[seg_key] = float(dur_str)
-                                    except: pass
-                except Exception as e:
-                    print(f"DEBUG: parse_idle_manifest failed: {e}", file=sys.stderr)
-                return seq, d_map
-
-            # 1. Bulk populate from current idle.m3u8 state
-            start_seq, dur_map = parse_idle_manifest()
-            if dur_map:
-                current_idle_segs = list(dur_map.keys())
-                # Sync media sequence: FFmpeg's sequence is for the FIRST segment in the file.
-                # So we set our sequence to match.
-                self.hls._media_sequence = start_seq
-                
-                # Add ALL segments currently in the idle.m3u8 window to ours
-                for sname in current_idle_segs[-self.hls.window:]:
-                    sdur = dur_map[sname]
-                    self.hls.add_segment(sname, sdur, map_file="init.mp4")
-                
-                # Determine where we are in global sequence
-                last_name = current_idle_segs[-1]
-                current_seq = int(last_name.split("_")[1].split(".")[0]) + 1
-                print(f"DEBUG: Synced to idle.m3u8. BaseSeq={start_seq}, NextIdx={current_seq}", file=sys.stderr)
-            else:
-                existing_segments = get_segments()
-                if existing_segments:
-                    start_index = max(0, len(existing_segments) - self.hls.window)
-                    for sname in existing_segments[start_index:]:
-                        self.hls.add_segment(sname, 6.0, map_file="init.mp4")
-                    last_name = existing_segments[-1]
-                    current_seq = int(last_name.split("_")[1].split(".")[0]) + 1
-                else:
-                    current_seq = 0
-
-            # 2. Continuous streaming loop
-            resumed_from_wait = False
-            while not self._live_started and self.alive:
-                try:
-                    if is_global_live_active():
-                        await asyncio.sleep(0.1)
-                        resumed_from_wait = True
-                        continue
-
-                    if resumed_from_wait:
-                        all_segs = get_segments()
-                        if all_segs:
-                            last_seg_name = all_segs[-1]
-                            new_seq = int(last_seg_name.split("_")[1].split(".")[0])
-                            print(f"DEBUG: Resuming from live. Jumping to {new_seq}", file=sys.stderr)
-                            current_seq = new_seq
-                            self.hls.switch_source("idle", force=True)
-                        resumed_from_wait = False
-
-                    seg_name = f"idle_{current_seq:06d}.m4s"
-                    seg_path = HLS_DIR / seg_name
-                    
-                    if seg_path.exists():
-                        _, dur_map = parse_idle_manifest()
-                        actual_dur = dur_map.get(seg_name, 6.0) 
-                        self.hls.add_segment(seg_name, actual_dur, map_file="init.mp4")
-                        await self.ws.send_json({
-                            "type": "video_segment",
-                            "uri": f"/hls/{seg_name}",
-                            "dur": actual_dur,
-                            "index": current_seq
-                        })
-                        current_seq += 1
-                    else:
-                        all_segs = get_segments()
-                        future = [int(f.split("_")[1].split(".")[0]) for f in all_segs if int(f.split("_")[1].split(".")[0]) > current_seq]
-                        if future:
-                            current_seq = min(future)
-                            continue
-                        await asyncio.sleep(0.5)
-                except Exception as inner_e:
-                    print(f"ERROR: Error in idle loop iteration: {inner_e}", file=sys.stderr)
-                    await asyncio.sleep(1.0)
-
-            print(f"DEBUG: _seed_idle_until_live exited", file=sys.stderr)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"ERROR: _seed_idle_until_live CRASHED: {e}", file=sys.stderr)
 
     async def run(self):
-        # Start a receiver task so client can send us logs (client_log messages)
+        print(f"DEBUG: [Session {self.session_id}] run() starting", flush=True)
         recv_task = asyncio.create_task(self._recv_loop())
+        video_task = asyncio.create_task(self.video_loop())
+        initial_tts_task = None
+        
         try:
+            print(f"DEBUG: [Session {self.session_id}] Sending 'started' status...", flush=True)
             await self.ws.send_json({"type": "status", "stage": "started"})
-            gpt_iter = gpt_text_stream("Say hello")
-            tts_task = asyncio.create_task(elevenlabs_stream(gpt_iter, self.roller))
-            video_task = asyncio.create_task(self.video_loop())
+            print(f"DEBUG: [Session {self.session_id}] Status 'started' sent", flush=True)
             
-            # Wait for initial TTS to finish, but don't close session
-            await asyncio.gather(tts_task)
-            
-            # Keep session alive until client disconnects (recv_task ends)
-            # recv_task finishes when ws.receive_text raises exception (disconnect)
-            await recv_task
-            
-            self.alive = False
-            await video_task
-        except WebSocketDisconnect:
-            self.alive = False
-        except Exception as e:
+            # Push a "welcome" prompt if desired, as a background task
             try:
-                await self.ws.send_json({"type": "error", "message": str(e)})
-            except Exception:
-                pass
-            self.alive = False
-        finally:
-            _active_sessions.discard(self)
-            print(f"DEBUG: Session unregistered. Active sessions: {len(_active_sessions)}", flush=True)
-            recv_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await recv_task
-
-    async def _remux_mp4_to_m4s(self, src_mp4: Path, dst_m4s: Path, init_map_path: Optional[Path] = None):
-        dst_m4s.parent.mkdir(parents=True, exist_ok=True)
-        # Use ffmpeg to split into fMP4 segment + optional init file
-        # If init_map_path is provided, we use -f hls which naturally splits init and segments.
-        # Otherwise we try standard fragmentation (though usually HLS prefers split or self-init).
-        
-        cmd = []
-        cwd = dst_m4s.parent # Run in HLS dir to keep paths simple if convenient, but we use absolute paths mostly.
-        
-        if init_map_path:
-            # Generate init.mp4 + segment.m4s using HLS muxer
-            # We treat the input as a single "stream" of duration ~infinity to get one segment,
-            # but we force the filename.
-            # NOTE: -hls_fmp4_init_filename expects just a filename usually if we want it in the same dir?
-            # Let's use absolute paths where possible or run in cwd.
+                print(f"DEBUG: [Session {self.session_id}] Preparing welcome TTS...", flush=True)
+                gpt_iter = gpt_text_stream("Say hello")
+                initial_tts_task = asyncio.create_task(elevenlabs_stream(gpt_iter, self.roller))
+                print(f"DEBUG: [Session {self.session_id}] Welcome TTS task created", flush=True)
+            except Exception as tts_e:
+                print(f"ERROR: [Session {self.session_id}] Failed to start welcome TTS: {tts_e}", flush=True)
             
-            # Using -f hls implies generating a playlist check. We can ignore the playlist.
+            # The session life is tied STRICTLY to the receive loop (the WS connection)
+            print(f"DEBUG: [Session {self.session_id}] Awaiting recv_task...", flush=True)
+            await recv_task
+            print(f"DEBUG: [Session {self.session_id}] recv_task finished naturally", flush=True)
+            
+        except WebSocketDisconnect:
+            print(f"DEBUG: WebSocket disconnected for session {self.session_id}", flush=True)
+        except Exception as e:
+            print(f"ERROR: Session {self.session_id} died in run(): {e}", file=sys.stderr, flush=True)
+        finally:
+            self.alive = False
+            hls_manager.live_sessions.discard(self.session_id)
+            
+            print(f"DEBUG: [Session {self.session_id}] Cleaning up tasks...", flush=True)
+            # Cleanup all tasks
+            for name, task in [("recv", recv_task), ("video", video_task), ("tts", initial_tts_task)]:
+                if task and not task.done():
+                    print(f"DEBUG: [Session {self.session_id}] Cancelling {name} task", flush=True)
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+            
+            print(f"DEBUG: Session cleanup complete for {self.session_id}", flush=True)
+
+    async def _remux_mp4_to_m4s(self, src_mp4: Path, dst_m4s: Path, init_map_path: Path):
+        dst_m4s.parent.mkdir(parents=True, exist_ok=True)
+        cwd = dst_m4s.parent
+        
+        # We use a robust fragmented MP4 creation command.
+        # If the init file doesn't exist, we create it.
+        # Otherwise, we just create the segment.
+        
+        flags = "frag_keyframe+empty_moov+default_base_moof"
+        if not init_map_path.exists():
+             # Create BOTH init and first segment
+             cmd = [
+                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-i", str(src_mp4),
+                 "-c", "copy",
+                 "-f", "mp4", "-movflags", flags,
+                 "-hls_segment_type", "fmp4", # not strictly needed for direct mp4 output but good context
+                 str(dst_m4s)
+             ]
+             proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd))
+             await proc.wait()
+             
+             # Extract the init part. A simple way is using -f hls briefly or manual extract.
+             # Actually, simpler: use -f hls for the FIRST segment to get both.
+             init_cmd = [
+                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                 "-i", str(src_mp4),
+                 "-c", "copy",
+                 "-f", "hls", "-hls_time", "999", "-hls_segment_type", "fmp4",
+                 "-hls_fmp4_init_filename", init_map_path.name,
+                 "-hls_segment_filename", "tmp_init_remux_%d.m4s",
+                 "tmp_init.m3u8"
+             ]
+             proc = await asyncio.create_subprocess_exec(*init_cmd, cwd=str(cwd))
+             await proc.wait()
+             # Rename the first segment to target
+             if (cwd / "tmp_init_remux_0.m4s").exists():
+                 (cwd / "tmp_init_remux_0.m4s").replace(dst_m4s)
+             # Cleanup temp files
+             with contextlib.suppress(OSError):
+                 (cwd / "tmp_init.m3u8").unlink()
+        else:
+            # Just create the segment, ensuring it's fragmented
+            # We use -f mp4 with fragmentation flags; HLS.js handles this fine as an .m4s
             cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                 "-i", str(src_mp4),
-                "-c:v", "copy", "-c:a", "copy",
-                "-f", "hls",
-                "-hls_time", "9999", 
-                "-hls_segment_type", "fmp4",
-                # "-hls_flags", "single_file",  <-- REMOVED to ensure split init
-                
-                "-hls_fmp4_init_filename", init_map_path.name,
-                "-hls_segment_filename", dst_m4s.name,
-                "dummy_manifest.m3u8" 
+                "-c", "copy",
+                "-f", "mp4", "-movflags", flags,
+                str(dst_m4s)
             ]
-            cwd = init_map_path.parent # Assume init and dst are in same dir (HLS_DIR)
-        else:
-            # Legacy/Fallback: Self-contained or just raw remux (mimicking previous behavior)
-             cmd = [
-                "ffmpeg", "-y",
-                "-i", str(src_mp4),
-                "-map", "0:v:0", "-c:v", "copy",
-                "-map", "0:a:0?", "-c:a", "copy",
-                "-movflags", "+default_base_moof+frag_keyframe+separate_moof",
-                "-f", "mp4", str(dst_m4s)
-            ]
-             cwd = dst_m4s.parent
+            proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd))
+            await proc.wait()
 
-        proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        out, err = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg remux failed (rc={proc.returncode}): {err.decode('utf-8', errors='replace')}")
-        
-        # Cleanup dummy manifest if it exists
-        if init_map_path:
-             with contextlib.suppress(OSError):
-                (cwd / "dummy_manifest.m3u8").unlink()
+    async def _get_media_duration(self, file_path: Path) -> float:
+        try:
+            # Try getting duration from format first
+            cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)]
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, _ = await proc.communicate()
+            val = stdout.decode().strip()
+            if val and val != "N/A":
+                return float(val)
+            
+            # Fallback to stream duration if format duration is N/A
+            cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)]
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, _ = await proc.communicate()
+            val = stdout.decode().strip()
+            if val and val != "N/A":
+                return float(val)
+            
+            return SEG_LEN_MS / 1000.0
+        except Exception:
+            return SEG_LEN_MS / 1000.0
 
     async def _recv_loop(self):
-        """Receive messages from client (e.g. forwarded hls.js logs) and persist them for inspection."""
-        log_path = Path('/tmp/hls_client.log')
+        print(f"DEBUG: Starting _recv_loop for session {self.session_id}", flush=True)
         while self.alive:
             try:
                 data = await self.ws.receive_text()
-            except Exception:
-                break
-            try:
                 msg = json.loads(data)
-            except Exception:
-                # write raw line
-                try:
-                    log_path.parent.mkdir(parents=True, exist_ok=True)
-                    with log_path.open('a', encoding='utf-8') as f:
-                        f.write(f"{time.time()}: RAW: {data}\n")
-                except Exception:
-                    pass
-                continue
-
-            if isinstance(msg, dict):
                 mtype = msg.get('type')
-                if mtype == 'client_log':
-                    level = msg.get('level', 'info')
-                    text = msg.get('msg') or msg.get('message') or str(msg)
-                    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level}] {text}\n"
-                    try:
-                        log_path.parent.mkdir(parents=True, exist_ok=True)
-                        with log_path.open('a', encoding='utf-8') as f:
-                            f.write(line)
-                        print(f"CLIENT_LOG: {line.strip()}", flush=True)
-                    except Exception:
-                        print(f"CLIENT_LOG_WRITE_FAILED: {line.strip()}", flush=True)
-                elif mtype == 'control':
+                if mtype != 'client_log':
+                    print(f"DEBUG: Received WS message: {mtype}", flush=True)
+                if mtype == 'control':
                     action = msg.get('action')
-                    try:
-                        if action == 'start_idle':
-                            if IDLE_LOOP_MP4.exists():
-                                self.hls.start_idle_segmentation(IDLE_LOOP_MP4)
-                                await self.ws.send_json({"type": "status", "stage": "idle_running", "note": "idle started"})
-                                print("DEBUG: idle started via control", flush=True)
-                            else:
-                                await self.ws.send_json({"type": "status", "stage": "idle_missing", "note": f"Idle loop file not found: {IDLE_LOOP_MP4}"})
-                        elif action == 'test_live':
-                            print("DEBUG: Starting fake live test", flush=True)
-                            asyncio.create_task(self.run_fake_live_test())
-                    except Exception as e:
-                        print(f"DEBUG: error handling control msg: {e}", flush=True)
+                    print(f"DEBUG: Control action: {action}", flush=True)
+                    if action == 'start_idle':
+                        hls_manager.ensure_idle_loop()
+                    elif action == 'test_live':
+                        asyncio.create_task(self.run_fake_live_test())
                 elif mtype == 'prompt':
-                    prompt_text = msg.get('text', '')
-                    if prompt_text.strip():
-                        print(f"DEBUG: Received prompt: {prompt_text}", flush=True)
-                        # Handle prompt asynchronously so we don't block recv loop
-                        asyncio.create_task(self._handle_prompt(prompt_text))
-                        await self.ws.send_json({"type": "status", "stage": "accepted", "note": "Prompt accepted"})
-                    else:
-                        await self.ws.send_json({"type": "error", "message": "Prompt is empty"})
-                else:
-                    print(f"WS RECV: {msg}", flush=True)
+                    print(f"DEBUG: Prompt received: {msg.get('text')[:20]}...", flush=True)
+                    asyncio.create_task(self._handle_prompt(msg.get('text', '')))
+                elif mtype == 'client_log':
+                    # Optional: log client-side errors to server stdout
+                    pass
+            except Exception as e:
+                print(f"DEBUG: _recv_loop exception: {e}", flush=True)
+                break
+        print(f"DEBUG: _recv_loop finished for session {self.session_id}", flush=True)
 
     async def run_fake_live_test(self):
-        """Simulate a live generation event by remuxing existing .ts segments from HLS_DIR."""
-        if self._live_started:
-            print("DEBUG: Live test already running or real live active", flush=True)
+        # Use a localized flag or just allow it if we are sure we want to override
+        if getattr(self, '_test_running', False):
+            print("DEBUG: Fake live test already running, skipping", flush=True)
             return
-
+        self._test_running = True
+        
+        print(f"DEBUG: Starting run_fake_live_test for session {self.session_id}", flush=True)
         try:
-            print("DEBUG: TEST - Stopping idle, starting fake live", flush=True)
-            self._live_started = True  # Stop local idle loop
-            set_global_live_active(True) # Signal others to hold off
-            
-            # Switch source to signal discontinuity
+            self._live_started = True 
+            hls_manager.live_sessions.add(self.session_id)
             self.hls.force_discontinuity()
             self.hls.switch_source("live_test")
             
-            # Find segments
-            import os
+            # Find available test segments
             ts_files = sorted([f for f in os.listdir(HLS_DIR) if f.startswith("segment_") and f.endswith(".ts")])
             if not ts_files:
-                print("DEBUG: TEST - No segment_*.ts files found", flush=True)
-                await self.ws.send_json({"type": "error", "message": "No test segments found"})
-                self._live_started = False
+                print(f"DEBUG: No segment_*.ts files found in {HLS_DIR}", flush=True)
+                # Fallback to whatever segments we have
+                ts_files = sorted([f for f in os.listdir(HLS_DIR) if f.endswith(".ts")])[:3]
+
+            if not ts_files:
+                print(f"ERROR: No .ts files found for live test in {HLS_DIR}", flush=True)
                 return
 
-            print(f"DEBUG: TEST - Found {len(ts_files)} segments to play", flush=True)
-            
             for i, ts_name in enumerate(ts_files):
                 if not self.alive: break
-                
                 ts_path = HLS_DIR / ts_name
-                # Use the original filename but with .m4s extension
                 m4s_name = ts_path.with_suffix('.m4s').name
                 m4s_path = HLS_DIR / m4s_name
+                init_name = f"live_init_{self.session_id}.mp4"
                 
-                # Remux .ts -> .m4s with a fake init map
-                init_name = "live_init.mp4" # Re-use the standard live init name
+                print(f"DEBUG: Remuxing {ts_name} -> {m4s_name}", flush=True)
                 await self._remux_mp4_to_m4s(ts_path, m4s_path, init_map_path=HLS_DIR/init_name)
                 
-                # Add to manifest
-                duration = 3.0 # Assumed duration for test segments
+                duration = 3.0 # Standard test duration
                 self.hls.add_segment(m4s_name, duration, map_file=init_name)
-                await self.ws.send_json({"type":"video_segment","uri":f"/hls/{m4s_name}","dur":duration})
-                
-                print(f"DEBUG: TEST - Served {m4s_name}", flush=True)
+                await hls_manager.broadcast({
+                    "type": "video_segment",
+                    "uri": f"/hls/{m4s_name}",
+                    "dur": duration,
+                    "index": i,
+                    "source": "live_test"
+                })
                 await asyncio.sleep(duration)
-
-            print("DEBUG: TEST - Finished playing segments", flush=True)
-            
         except Exception as e:
-            print(f"DEBUG: TEST - Error: {e}", flush=True)
-            await self.ws.send_json({"type": "error", "message": f"Test failed: {e}"})
+            print(f"ERROR: run_fake_live_test failed: {e}", flush=True)
         finally:
-            print("DEBUG: TEST - returning to idle", flush=True)
+            self._test_running = False
             self._live_started = False
-            set_global_live_active(False)
-            # Restart idle seeding
-            asyncio.create_task(self._seed_idle_until_live())
-
+            hls_manager.live_sessions.discard(self.session_id)
+            hls_manager.ensure_idle_loop()
+            print(f"DEBUG: run_fake_live_test finished for session {self.session_id}", flush=True)
 
     async def _handle_prompt(self, prompt_text: str):
-        """Run the LLM -> TTS -> Video generation pipeline for a single prompt."""
-        try:
-            await self.ws.send_json({"type": "status", "stage": "generating", "note": "Starting prompt processing"})
-            gpt_iter = gpt_text_stream(prompt_text)
-            tts_task = asyncio.create_task(elevenlabs_stream(gpt_iter, self.roller))
-            video_task = asyncio.create_task(self.video_loop())
-            await asyncio.gather(tts_task)
-            await asyncio.sleep(1.0)
-            self.alive = False
-            await video_task
-            await self.ws.send_json({"type": "done"})
-        except Exception as e:
-            print(f"ERROR: Prompt processing failed: {e}", flush=True)
-            try:
-                await self.ws.send_json({"type": "error", "message": f"Prompt processing failed: {str(e)}"})
-            except Exception:
-                pass
+        if not prompt_text.strip(): return
+        await self.ws.send_json({"type": "status", "stage": "generating", "note": prompt_text})
+        gpt_iter = gpt_text_stream(prompt_text)
+        await elevenlabs_stream(gpt_iter, self.roller)
 
     async def video_loop(self):
-        idle_task = asyncio.create_task(self._seed_idle_until_live())
-        first_live_done = False
         try:
             while self.alive or self.roller.has_window_ready():
                 if not self.roller.has_window_ready():
-                    await asyncio.sleep(0.05)
-                    continue
-
+                    # If we WERE live, and now we are silent, release the live lock
+                    if self._live_started:
+                        print(f"DEBUG: [Session {self.session_id}] Silent, releasing live status", flush=True)
+                        self._live_started = False
+                        hls_manager.live_sessions.discard(self.session_id)
+                    await asyncio.sleep(0.5); continue
+                
                 audio_slice = self.roller.next_window()
-                if not audio_slice:
+                print(f"DEBUG: delegating audio slice {audio_slice.name} to worker", flush=True)
+                
+                try:
+                    # Delegate to Redis worker
+                    tmp_mp4 = await delegate_video_generation(audio_slice)
+                except Exception as e:
+                    print(f"ERROR: delegation failed: {e}", flush=True)
                     continue
+                
+                seg_name = f"seg_{self.session_id}_{self.seg_counter:04d}.m4s"
+                init_name = f"live_init_{self.session_id}.mp4"
+                
+                # PROBE SOURCE MP4 FIRST for accurate duration
+                actual_dur = await self._get_media_duration(tmp_mp4)
+                print(f"DEBUG: Segment {seg_name} probed duration: {actual_dur:.3f}s", flush=True)
 
-                tmp_mp4 = HLS_DIR / f"chunk_{self.seg_counter:04d}.mp4"
-                await run_infinite_talk_window(audio_slice, tmp_mp4)
-
-                seg_name = f"seg_{self.seg_counter:04d}.m4s"
-                seg_path = HLS_DIR / seg_name
-                init_name = "live_init.mp4"
-                await self._remux_mp4_to_m4s(tmp_mp4, seg_path, init_map_path=HLS_DIR/init_name)
-                with contextlib.suppress(Exception):
-                    tmp_mp4.unlink()
-
-                if not first_live_done:
+                await self._remux_mp4_to_m4s(tmp_mp4, HLS_DIR/seg_name, init_map_path=HLS_DIR/init_name)
+                
+                # Delete source MP4 after remux to save space
+                with contextlib.suppress(OSError): tmp_mp4.unlink()
+                
+                if not self._live_started:
                     self._live_started = True
+                    hls_manager.live_sessions.add(self.session_id)
                     self.hls.force_discontinuity()
                     self.hls.switch_source("live")
-                    first_live_done = True
 
-                self.hls.add_segment(seg_name, SEG_LEN_MS / 1000.0, map_file=init_name)
-                await self.ws.send_json({"type":"video_segment","uri":f"/hls/{seg_name}","index":self.seg_counter,"dur_ms":SEG_LEN_MS})
+                # Use the probed duration from original MP4, not the remuxed .m4s which ffprobe often misreads
+                self.hls.add_segment(seg_name, actual_dur, map_file=init_name)
+                await hls_manager.broadcast({
+                    "type": "video_segment",
+                    "uri": f"/hls/{seg_name}",
+                    "index": self.seg_counter,
+                    "dur": actual_dur,
+                    "source": "live"
+                })
                 self.seg_counter += 1
-                await asyncio.sleep(SEG_LEN_MS / 1000.0)
-        except FileNotFoundError as e:
-            if not first_live_done:
-                await self.ws.send_json({"type":"status","stage":"idle_only","note":str(e)})
+                await asyncio.sleep(actual_dur)
         finally:
-            idle_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await idle_task
-async def run_infinite_talk_window(audio_wav: Path, out_mp4: Path):
-    # If preflight failed, bail early so we stay in idle and keep UI clean
-    if PREFLIGHT_ISSUES:
-        raise FileNotFoundError("; ".join(PREFLIGHT_ISSUES))
-
-    cmd = [
-        INFINITETALK_BIN,
-        "--ref_image", REF_IMAGE_ABS,
-        "--input_audio", str(audio_wav),
-        "--output_video", str(out_mp4),
-        "--duration_ms", str(SEG_LEN_MS),
-        "--no_audio",
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"InfiniteTalk failed: {stderr.decode()}")   
+            hls_manager.live_sessions.discard(self.session_id)
+            print(f"DEBUG: video_loop finished for session {self.session_id}", flush=True)
 
 # Run with: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

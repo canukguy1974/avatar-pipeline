@@ -51,7 +51,7 @@ export default function Page() {
           hlsRef.current.destroy()
         }
 
-        const hls = new Hls({ maxBufferLength: 10, debug: true })
+        const hls = new Hls({ maxBufferLength: 10, debug: false })
         hlsRef.current = hls
 
         // Load the main managed manifest (manifest.m3u8) which handles both idle and live segments
@@ -70,14 +70,10 @@ export default function Page() {
 
         // log HLS errors/events to the UI log to aid debugging
         hls.on(Hls.Events.ERROR, (_evt: any, data: any) => {
-          const msg = 'HLS ERROR: ' + (data?.type || '') + ' ' + JSON.stringify(data)
+          if (!data.fatal) return // Ignore non-fatal errors for log window
+          const msg = 'HLS FATAL ERROR: ' + (data?.type || '') + ' ' + (data?.details || '')
           appendLog(msg)
           try { if (wsRef.current && wsRef.current.readyState === 1) wsRef.current.send(JSON.stringify({ type: 'client_log', level: 'error', msg })) } catch (e) { }
-        })
-        hls.on(Hls.Events.LOG, (_evt: any, data: any) => {
-          const msg = 'HLS LOG: ' + JSON.stringify(data)
-          appendLog(msg)
-          try { if (wsRef.current && wsRef.current.readyState === 1) wsRef.current.send(JSON.stringify({ type: 'client_log', level: 'log', msg })) } catch (e) { }
         })
 
         setAttached(true)
@@ -112,7 +108,8 @@ export default function Page() {
         const msg = JSON.parse(ev.data)
         if (msg.type === 'video_segment') {
           const idx = msg.index !== undefined ? msg.index : '?'
-          appendLog(`Segment #${idx} ready: ${msg.uri}`)
+          const source = msg.source || 'segment'
+          appendLog(`${source.charAt(0).toUpperCase() + source.slice(1)} #${idx} ready: ${msg.uri}`)
           if (!attachedRef.current) {
             attachHls()
             // attachedRef.current will be set true inside attachHls
@@ -158,6 +155,15 @@ export default function Page() {
       wsRef.current.send(JSON.stringify({ type: 'control', action: 'start_idle' }))
       appendLog('Sent start_idle')
     }
+  }
+
+  const triggerTestLive = () => {
+    if (!wsRef.current || wsRef.current.readyState !== 1) {
+      appendLog('WS not open; cannot trigger test')
+      return
+    }
+    wsRef.current.send(JSON.stringify({ type: 'control', action: 'test_live' }))
+    appendLog('Sent test_live trigger')
   }
 
   // Mock mode video source
@@ -212,6 +218,7 @@ export default function Page() {
             <span className={`rounded-full w-2.5 h-2.5 ${wsStatus === 'open' ? 'bg-emerald-400' : wsStatus === 'connecting' ? 'bg-yellow-400' : 'bg-zinc-600'}`}></span>
             <span className="hidden sm:inline">WS: {wsStatus}</span>
             <button onClick={toggleIdle} className={`ml-3 px-2 py-1 rounded ${idleRunning ? 'bg-red-600' : 'bg-emerald-600'}`}>{idleRunning ? 'Stop Idle' : 'Start Idle'}</button>
+            <button onClick={triggerTestLive} className="ml-2 px-2 py-1 rounded bg-blue-600 hover:bg-blue-500">Test Live</button>
             <label className="flex items-center gap-2 ml-4">
               <input type="checkbox" checked={mockMode} onChange={(e) => setMockMode(e.target.checked)} />
               Video mode

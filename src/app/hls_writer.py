@@ -1,7 +1,7 @@
 # src/app/hls_writer.py
 import subprocess, mimetypes, contextlib, math, os
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 class HLSWriter:
     def __init__(self, hls_dir: Path, window: int = 20, default_td: float = 6.0, delete_old: bool = True):
@@ -69,16 +69,27 @@ class HLSWriter:
                 os.remove(str(self.hls_dir / "manifest.m3u8"))
             tmp_manifest.replace(self.hls_dir / "manifest.m3u8")
 
-    def add_segment(self, filename: str, duration: float, map_file: str = "init.mp4"):
+    def add_segment(self, filename: str, duration: float, map_file: str = "init.mp4", delete_old: Optional[bool] = None):
+        # IDEMPOTENCY: Don't add the same file twice in a row
+        if self._segments and self._segments[-1][0] == filename:
+            # print(f"DEBUG: [HLSWriter] Skipping duplicate segment {filename}")
+            return
+
+        print(f"DEBUG: [HLSWriter] Adding segment {filename} ({duration:.3f}s), map={map_file}, source={self._current_source}", flush=True)
         self._segments.append((filename, duration, self._pending_discontinuity, map_file))
         self._pending_discontinuity = False
+        
+        should_delete = delete_old if delete_old is not None else self.delete_old
         
         while len(self._segments) > self.window:
             popped = self._segments.pop(0)
             p_name, p_dur, p_discont, p_map = popped
-            if self.delete_old:
+            if should_delete:
                 with contextlib.suppress(Exception):
-                    (self.hls_dir / p_name).unlink()
+                    p_path = self.hls_dir / p_name
+                    if p_path.exists():
+                        p_path.unlink()
+                        # print(f"DEBUG: [HLSWriter] Deleted old segment {p_name}")
             self._media_sequence += 1
             if p_discont:
                 if not hasattr(self, '_discontinuity_sequence'):
@@ -105,6 +116,13 @@ class HLSWriter:
         except Exception:
             pass
         
+        # CLEANUP STALE FILES to avoid Manager jumping into the past
+        print(f"DEBUG: Purging stale idle files in {self.hls_dir}", flush=True)
+        for p in list(self.hls_dir.glob('idle_*.m4s')):
+            with contextlib.suppress(Exception): p.unlink()
+        with contextlib.suppress(Exception): (self.hls_dir / 'idle.m3u8').unlink()
+        with contextlib.suppress(Exception): (self.hls_dir / 'init.mp4').unlink()
+
         idle_mp4_abs = idle_mp4.resolve()
         hls_dir_abs = self.hls_dir.resolve()
         
@@ -114,10 +132,12 @@ class HLSWriter:
             "-stream_loop", "-1",
             "-i", str(idle_mp4_abs),
             "-c:v", "copy", "-c:a", "copy",
+            "-avoid_negative_ts", "make_zero",
+            "-bsf:a", "aac_adtstoasc", # Fix malformed AAC bitstream in fMP4
             "-f", "hls",
             "-hls_segment_type", "fmp4",
-            "-hls_time", "5",
-            "-hls_list_size", "30",
+            "-hls_time", "3",
+            "-hls_list_size", "300",
             "-hls_flags", "delete_segments+independent_segments",
             "-hls_fmp4_init_filename", "init.mp4",
             "-hls_segment_filename", "idle_%06d.m4s",
