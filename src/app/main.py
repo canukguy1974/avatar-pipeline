@@ -264,7 +264,7 @@ class HLSManager:
                 # AND jump to the latest available idle segment to avoid manifest timeline spam
                 if self.hls._current_source != "idle":
                     print("DEBUG: [HLSManager] Returning to IDLE source, jumping to latest", flush=True)
-                    self.hls.switch_source("idle", force=True, clear_buffer=True)
+                    self.hls.switch_source("idle", force=True)
                     
                     # CATCH UP: Skip segments we missed while live
                     all_segs = sorted([f for f in os.listdir(HLS_DIR) if f.startswith("idle_") and f.endswith(".m4s")])
@@ -566,19 +566,21 @@ class Session:
     async def _remux_mp4_to_m4s(self, src_mp4: Path, dst_m4s: Path, init_map_path: Path):
         dst_m4s.parent.mkdir(parents=True, exist_ok=True)
         cwd = dst_m4s.parent
-        is_ts = src_mp4.suffix.lower() == ".ts"
         
         # We use a robust fragmented MP4 creation command.
         flags = "frag_keyframe+empty_moov+default_base_moof"
-        bsf = ["-bsf:a", "aac_adtstoasc"] if is_ts else []
         
+        # USE RE-ENCODING for audio to bypass all 'Malformed AAC' bitstream issues.
+        # This is slightly slower than 'copy' but much more reliable.
+        acodec = ["-c:a", "aac", "-b:a", "128k"]
+
         if not init_map_path.exists():
              # Create BOTH init and first segment
              cmd = [
                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                  "-i", str(src_mp4),
                  "-map", "0:v", "-map", "0:a",
-                 "-c:v", "copy", "-c:a", "copy", *bsf,
+                 "-c:v", "copy", *acodec,
                  "-f", "mp4", "-movflags", flags,
                  str(dst_m4s)
              ]
@@ -591,7 +593,7 @@ class Session:
                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                  "-i", str(src_mp4),
                  "-map", "0:v", "-map", "0:a",
-                 "-c:v", "copy", "-c:a", "copy", *bsf,
+                 "-c:v", "copy", *acodec,
                  "-f", "hls", "-hls_time", "999", "-hls_segment_type", "fmp4",
                  "-hls_fmp4_init_filename", init_map_path.name,
                  "-hls_segment_filename", "tmp_init_remux_%d.m4s",
@@ -614,7 +616,7 @@ class Session:
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                 "-i", str(src_mp4),
                 "-map", "0:v", "-map", "0:a",
-                "-c:v", "copy", "-c:a", "copy", *bsf,
+                "-c:v", "copy", *acodec,
                 "-f", "mp4", "-movflags", flags,
                 str(dst_m4s)
             ]
@@ -681,10 +683,9 @@ class Session:
         
         print(f"DEBUG: Starting run_fake_live_test for session {self.session_id}", flush=True)
         try:
-            self._live_started = True 
             hls_manager.live_sessions.add(self.session_id)
             self.hls.force_discontinuity()
-            self.hls.switch_source("live_test", clear_buffer=True)
+            self.hls.switch_source("live_test")
             
             # Find available test segments
             ts_files = sorted([f for f in os.listdir(HLS_DIR) if f.startswith("segment_") and f.endswith(".ts")])
