@@ -118,8 +118,14 @@ async def delegate_video_generation(audio_wav: Path) -> Path:
     while time.time() - start < max_wait:
         res = redis_client.get(result_key)
         if res:
-            # Result path is absolute inside container, e.g. /app/output/...
-            return Path(res)
+            p = Path(res)
+            # Ensure path is absolute for backend to find it in the shared volume
+            if not p.is_absolute():
+                if str(p).startswith("output/"):
+                    p = Path("/app") / p
+                else:
+                    p = OUTPUT_DIR / p.name
+            return p
         await asyncio.sleep(0.5)
 
     raise TimeoutError(f"Video generation timed out for job {job_id}")
