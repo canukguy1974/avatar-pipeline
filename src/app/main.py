@@ -564,9 +564,11 @@ class Session:
         flags = "frag_keyframe+empty_moov+default_base_moof"
         if not init_map_path.exists():
              # Create BOTH init and first segment
+             # Using -map 0 ensures we map all streams from input.
              cmd = [
                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                  "-i", str(src_mp4),
+                 "-map", "0",
                  "-c", "copy", "-bsf:a", "aac_adtstoasc",
                  "-f", "mp4", "-movflags", flags,
                  str(dst_m4s)
@@ -574,11 +576,12 @@ class Session:
              proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
              stdout, stderr = await proc.communicate()
              if proc.returncode != 0:
-                 print(f"ERROR: ffmpeg failed (init/segment): {stderr.decode()}", flush=True)
+                 raise RuntimeError(f"ffmpeg failed (init/segment): {stderr.decode()}")
              
              init_cmd = [
                  "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                  "-i", str(src_mp4),
+                 "-map", "0",
                  "-c", "copy", "-bsf:a", "aac_adtstoasc",
                  "-f", "hls", "-hls_time", "999", "-hls_segment_type", "fmp4",
                  "-hls_fmp4_init_filename", init_map_path.name,
@@ -588,7 +591,7 @@ class Session:
              proc = await asyncio.create_subprocess_exec(*init_cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
              stdout, stderr = await proc.communicate()
              if proc.returncode != 0:
-                 print(f"ERROR: ffmpeg failed (init cmd): {stderr.decode()}", flush=True)
+                 raise RuntimeError(f"ffmpeg failed (init cmd): {stderr.decode()}")
 
              # Rename the first segment to target
              if (cwd / "tmp_init_remux_0.m4s").exists():
@@ -601,6 +604,7 @@ class Session:
             cmd = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                 "-i", str(src_mp4),
+                "-map", "0",
                 "-c", "copy", "-bsf:a", "aac_adtstoasc",
                 "-f", "mp4", "-movflags", flags,
                 str(dst_m4s)
@@ -608,7 +612,7 @@ class Session:
             proc = await asyncio.create_subprocess_exec(*cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
-                print(f"ERROR: ffmpeg failed (segment only): {stderr.decode()}", flush=True)
+                raise RuntimeError(f"ffmpeg failed (segment only): {stderr.decode()}")
 
     async def _get_media_duration(self, file_path: Path) -> float:
         try:
@@ -724,7 +728,8 @@ class Session:
             while self.alive or self.roller.has_window_ready():
                 if not self.roller.has_window_ready():
                     # If we WERE live, and now we are silent, release the live lock
-                    if self._live_started:
+                    # BUT NOT if a test run is active!
+                    if self._live_started and not self._test_running:
                         print(f"DEBUG: [Session {self.session_id}] Silent, releasing live status", flush=True)
                         self._live_started = False
                         hls_manager.live_sessions.discard(self.session_id)
